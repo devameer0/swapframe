@@ -241,8 +241,13 @@ async function runHF(jobId, st, photo, charImg) {
     const [p1, c1] = await Promise.all([resizeBlob(pb, 1024), resizeBlob(ib, 768)]);
     let out;
     try {
-      out = await gradioRun(st.space, st.api_name || 'infer', ([pp, ip]) => [st.prompt || SWAP_PROMPT, [{ image: pp }, { image: ip }], 'Distilled (4 steps)', 0, true, w, h, 4, 1.0, false],
-        [[p1, 'photo.png'], [c1, 'character.png']], 'Style transfer');
+      const toData = (b) => new Promise((ok, no) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.onerror = no; fr.readAsDataURL(b); });
+      const [pd, cd] = await Promise.all([toData(p1), toData(c1)]);
+      setProg(50, 'Generating on the GPU (usually 15–60 s)…');
+      const { data: rr, error: fe } = await sb.functions.invoke('hf', { body: { photo: pd, character: cd, prompt: st.prompt || SWAP_PROMPT, width: w, height: h } });
+      if (fe) { let m = fe.message; try { m = (await fe.context.json()).error || m; } catch {} throw new Error(m); }
+      if (!rr?.image) throw new Error(rr?.error || 'No image returned');
+      out = rr.image;
     } catch (e) { throw new Error(e.message + ' — the free GPU may be busy or your free quota used up. Please try again later.'); }
     if (!jobId) { showLocalResult(out); setProg(100, 'Done'); $('#go').disabled = false; return; }
     setProg(96, 'Saving your result…');
