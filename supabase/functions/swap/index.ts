@@ -89,7 +89,7 @@ Deno.serve(async (req) => {
         return json({ job: data, provider: "replicate" });
       }
       const { data } = await patch({ prediction_id: "hf", status: "processing", error: null });
-      return json({ job: data, provider: "hf", space: `https://${HF_SPACE_HOST}`, api_name: "infer", fallback_space: `https://${HF_FALLBACK_HOST}`, photo_url: video, video_url: video, image_url: character_image,
+      return json({ job: data, provider: "hf", space: `https://${HF_SPACE_HOST}`, api_name: "infer", photo_url: video, video_url: video, image_url: character_image,
         replicate_available: !!replicateToken });
     }
 
