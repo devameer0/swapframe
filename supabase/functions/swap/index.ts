@@ -33,6 +33,30 @@ Deno.serve(async (req) => {
 
     if (action === "start") {
       if (job.prediction_id) return json({ job });
+      const { data: prof } = await admin.from("profiles").select("banned,credits,usage_count").eq("id", user.id).single();
+      if (!prof || prof.banned) {
+        await admin.from("jobs").update({ status: "failed", error: "Account banned", updated_at: new Date() }).eq("id", job.id);
+        return json({ error: "Your account is banned" }, 403);
+      }
+      const { data: st } = await admin.from("site_settings").select("data").eq("id", 1).single();
+      const settings = st?.data ?? {};
+      const { data: me } = await admin.from("profiles").select("role").eq("id", user.id).single();
+      if (settings.maintenance_mode && me?.role !== "admin") {
+        await admin.from("jobs").update({ status: "failed", error: "Maintenance mode", updated_at: new Date() }).eq("id", job.id);
+        return json({ error: "SwapFrame is in maintenance mode. Try again later." }, 503);
+      }
+      const daily = Number(settings.daily_limit ?? 3);
+      const since = new Date(); since.setUTCHours(0, 0, 0, 0);
+      const { count } = await admin.from("jobs").select("id", { count: "exact", head: true })
+        .eq("user_id", user.id).not("prediction_id", "is", null).gte("created_at", since.toISOString());
+      if (daily > 0 && (count ?? 0) >= daily && me?.role !== "admin") {
+        await admin.from("jobs").update({ status: "failed", error: "Daily limit reached", updated_at: new Date() }).eq("id", job.id);
+        return json({ error: `Daily limit of ${daily} swaps reached. Come back tomorrow.` }, 429);
+      }
+      if (prof.credits <= 0) {
+        await admin.from("jobs").update({ status: "failed", error: "No credits left", updated_at: new Date() }).eq("id", job.id);
+        return json({ error: "No credits left. Ask the admin for more." }, 402);
+      }
       const sign = async (p: string) =>
         (await admin.storage.from("uploads").createSignedUrl(p, 60 * 60 * 2)).data?.signedUrl;
       const [video, character_image] = await Promise.all([sign(job.video_path), sign(job.image_path)]);
@@ -49,6 +73,7 @@ Deno.serve(async (req) => {
         await admin.from("jobs").update({ status: "failed", error: p.detail ?? "Replicate error", updated_at: new Date() }).eq("id", job.id);
         return json({ error: p.detail ?? "Replicate error" }, 502);
       }
+      await admin.from("profiles").update({ credits: prof.credits - 1, usage_count: prof.usage_count + 1 }).eq("id", user.id);
       const { data } = await admin.from("jobs")
         .update({ prediction_id: p.id, status: p.status ?? "starting", updated_at: new Date() })
         .eq("id", job.id).select().single();

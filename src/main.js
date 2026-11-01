@@ -1,11 +1,13 @@
 import './style.css';
 import { createClient } from '@supabase/supabase-js';
+import { DEFAULTS, applyTheme } from './settings.js';
 
 const cfg = window.SWAPFRAME_CONFIG || {};
 const configured = !!cfg.SUPABASE_URL && !!cfg.SUPABASE_ANON_KEY &&
   !cfg.SUPABASE_URL.startsWith('YOUR_') && !cfg.SUPABASE_ANON_KEY.startsWith('YOUR_');
 const sb = configured ? createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY) : null;
 
+let S = { ...DEFAULTS };
 const LIMITS = { maxBytes: 100 * 1024 * 1024, minSec: 10, maxSec: 30, maxImg: 10 * 1024 * 1024,
   video: ['video/mp4', 'video/quicktime', 'video/webm'], image: ['image/png', 'image/jpeg', 'image/webp'] };
 const app = document.getElementById('app');
@@ -20,26 +22,28 @@ function shell(body) {
   const links = session
     ? `<a href="#/dashboard">Dashboard</a><a href="#" id="logout">Sign out</a>`
     : `<a href="#/signin">Sign in</a><a href="#/signup">Sign up</a>`;
-  app.innerHTML = `<div class="wrap"><nav><a class="logo" href="#/">SWAP<b>FRAME</b></a><div class="links">${links}</div></nav>
-  ${notice}${body}<footer>SwapFrame · outputs are AI-generated. Only use footage and characters you own or have permission to use.</footer></div>`;
+  const name = esc(S.site_name);
+  const logo = S.logo_url ? `<img src="${esc(S.logo_url)}" alt=""/>${name}` : (S.site_name === 'SwapFrame' ? 'SWAP<b>FRAME</b>' : name);
+  const banner = (S.maintenance_mode ? `<div class="announce">${name} is in maintenance mode — generation is paused.</div>` : '') +
+    (S.announcement ? `<div class="announce">${esc(S.announcement)}</div>` : '');
+  const flinks = (S.footer_links || []).filter((l) => /^https?:/.test(l.url)).map((l) => ` · <a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join('');
+  app.innerHTML = `${banner}<div class="wrap"><nav><a class="logo" href="#/">${logo}</a><div class="links">${links}</div></nav>
+  ${notice}${body}<footer>${name} · ${esc(S.footer_text)}${flinks}</footer></div>`;
   const lo = $('#logout'); if (lo) lo.onclick = async (e) => { e.preventDefault(); await sb.auth.signOut(); location.hash = '#/'; };
 }
 
 function landing() {
-  shell(`<section class="hero"><div class="tag">// RECAST ANY CLIP</div>
-  <h1>Your character.<br/><span>Their every move.</span></h1>
-  <p>Upload a short video and a character image. SwapFrame replaces the person on screen with your character while keeping the original motion, camera and background.</p>
-  <p style="margin-top:26px"><a class="btn" href="#/${session ? 'dashboard' : 'signup'}">${session ? 'Open dashboard' : 'Get started'}</a>
-  <a class="btn ghost" href="#/signin" style="margin-left:8px">Sign in</a></p></section>
-  <div class="grid">
-   <div class="card"><h3>01 · Drop a clip</h3><p>MP4, MOV or WebM, 10–30 seconds, up to 100&nbsp;MB.</p></div>
-   <div class="card"><h3>02 · Pick a character</h3><p>A clear PNG, JPG or WebP of the character you want in the shot.</p></div>
-   <div class="card"><h3>03 · Get the recast</h3><p>Same motion and framing, new performer. Download it or find it in your history.</p></div>
-  </div>`);
+  shell(`<section class="hero"><div class="tag">${esc(S.tagline)}</div>
+  <h1>${esc(S.hero_title)}<br/><span>${esc(S.hero_highlight)}</span></h1>
+  <p>${esc(S.hero_text)}</p>
+  <p style="margin-top:26px"><a class="btn" href="#/${session ? 'dashboard' : 'signup'}">${session ? 'Open dashboard' : esc(S.cta_text)}</a>
+  ${session ? '' : '<a class="btn ghost" href="#/signin" style="margin-left:8px">Sign in</a>'}</p></section>
+  <div class="grid">${(S.sections || []).map((c) => `<div class="card"><h3>${esc(c.title)}</h3><p>${esc(c.text)}</p></div>`).join('')}</div>`);
 }
 
 function authForm(mode) {
   const up = mode === 'signup';
+  if (up && !S.signups_open) { shell(`<div class="form card"><h2>Sign-ups are closed</h2><p style="color:var(--mute)">New accounts are paused right now. Already registered? <a href="#/signin">Sign in</a>.</p></div>`); return; }
   shell(`<form class="form card" id="f"><h2>${up ? 'Create account' : 'Welcome back'}</h2>
    <label>Email</label><input type="email" id="email" required autocomplete="email"/>
    <label>Password</label><input type="password" id="pw" required minlength="8" autocomplete="${up ? 'new-password' : 'current-password'}"/>
@@ -70,7 +74,7 @@ function videoDuration(file) {
 async function validate(video, image) {
   if (!video) return 'Choose a video.';
   if (!LIMITS.video.includes(video.type)) return 'Video must be MP4, MOV or WebM.';
-  if (video.size > LIMITS.maxBytes) return 'Video must be 100 MB or smaller.';
+  if (video.size > LIMITS.maxBytes) return `Video must be ${S.max_upload_mb} MB or smaller.`;
   const d = await videoDuration(video).catch(() => NaN);
   if (!(d >= LIMITS.minSec && d <= LIMITS.maxSec)) return `Video must be ${LIMITS.minSec}–${LIMITS.maxSec} seconds (yours: ${isNaN(d) ? 'unknown' : d.toFixed(1) + 's'}).`;
   if (!image) return 'Choose a character image.';
@@ -82,8 +86,8 @@ async function validate(video, image) {
 async function dashboard() {
   if (configured && !session) { location.hash = '#/signin'; return; }
   shell(`<div class="dash">
-  <div class="card"><h3>New recast</h3>
-   <label>Source video (10–30s, ≤100 MB, MP4/MOV/WebM)</label><input type="file" id="vid" accept="video/mp4,video/quicktime,video/webm"/>
+  <div class="card"><h3>New recast</h3><div id="me" style="color:var(--mute);font-size:13px"></div>
+   <label>Source video (${LIMITS.minSec}–${LIMITS.maxSec}s, ≤${S.max_upload_mb} MB, MP4/MOV/WebM)</label><input type="file" id="vid" accept="video/mp4,video/quicktime,video/webm"/>
    <label>Character image (PNG/JPG/WebP, ≤10 MB)</label><input type="file" id="img" accept="image/png,image/jpeg,image/webp"/>
    <img id="imgprev" class="preview" hidden alt="character preview"/>
    <label>Quality</label><select id="res"><option value="720">720p</option><option value="480">480p (cheaper)</option></select>
@@ -98,7 +102,12 @@ async function dashboard() {
   ['#vid', '#img', '#consent'].forEach((s) => $(s).addEventListener('change', refresh));
   $('#img').addEventListener('change', () => { const f = $('#img').files[0]; const p = $('#imgprev'); if (f) { p.src = URL.createObjectURL(f); p.hidden = false; } });
   go.onclick = startJob;
-  if (configured) loadHistory();
+  if (configured) { loadHistory(); loadMe(); }
+}
+async function loadMe() {
+  const { data } = await sb.from('profiles').select('credits,banned').eq('id', session.user.id).maybeSingle();
+  const el = $('#me'); if (!el || !data) return;
+  el.innerHTML = data.banned ? '<span style="color:var(--bad)">Your account is suspended.</span>' : `Credits: ${data.credits} · Daily limit: ${S.daily_limit || 'none'}`;
 }
 
 const setProg = (pct, text) => { $('#prog').style.width = pct + '%'; $('#stat').textContent = text; };
@@ -127,7 +136,7 @@ async function startJob() {
     if (error) throw error;
     setProg(25, 'Starting generation…');
     await callFn({ action: 'start', job_id: job.id, resolution: $('#res').value });
-    loadHistory(); poll(job.id);
+    loadHistory(); loadMe(); poll(job.id);
   } catch (e) { err.textContent = e.message || String(e); setProg(0, 'Failed'); $('#go').disabled = false; }
 }
 
@@ -173,8 +182,20 @@ function route() {
   else if (r === 'dashboard') dashboard(); else landing();
 }
 
-(async () => {
+async function loadSettings() {
   if (sb) {
+    const { data } = await sb.from('site_settings').select('data').eq('id', 1).maybeSingle();
+    if (data?.data) S = { ...DEFAULTS, ...data.data };
+  }
+  LIMITS.maxBytes = Number(S.max_upload_mb) * 1024 * 1024; LIMITS.minSec = Number(S.min_seconds); LIMITS.maxSec = Number(S.max_seconds);
+  applyTheme(S);
+}
+
+(async () => {
+  await loadSettings().catch(() => applyTheme(S));
+  if (sb) {
+    // live updates when the admin app changes settings (needs Realtime enabled on site_settings; falls back to load-time)
+    sb.channel('settings').on('postgres_changes', { event: '*', schema: 'public', table: 'site_settings' }, () => loadSettings().then(route)).subscribe();
     session = (await sb.auth.getSession()).data.session;
     sb.auth.onAuthStateChange((_e, s) => { const changed = !!s !== !!session; session = s; if (changed) route(); });
   }
