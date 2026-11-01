@@ -227,6 +227,7 @@ async function gradioRun(space, apiName, buildData, files, label) {
   }
   throw new Error(`${label}: connection closed before a result.`);
 }
+const imgSize = (f) => new Promise((res) => { const i = new Image(); i.onload = () => { res([i.naturalWidth, i.naturalHeight]); URL.revokeObjectURL(i.src); }; i.onerror = () => res([1024, 1024]); i.src = URL.createObjectURL(f); });
 async function runHF(jobId, st, photo) {
   try {
     setProg(30, 'Sending photos to the free GPU…');
