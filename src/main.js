@@ -157,27 +157,37 @@ async function runHF(jobId, st, dur, res) {
     const [vp, ip] = await upRes.json();
     const file = (path) => ({ path, meta: { _type: 'gradio.FileData' } });
     const seconds = Math.max(2, Math.min(20, Math.floor(dur)));
-    const call = await fetch(`${space}/gradio_api/call/animate_scene`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: [file(vp), seconds, file(ip), 'Character Swap', res] }) });
-    if (!call.ok) throw new Error(`Space call failed (${call.status})`);
-    const { event_id } = await call.json();
+    // Use Gradio's queue protocol (what the Space's own UI and gradio_client use). The simple /call API
+    // fails on this Space because it omits the hidden State input, so look up the endpoint and pad inputs.
+    const cfg = await fetch(`${space}/config`).then((r) => r.json());
+    const fnIndex = cfg.dependencies.findIndex((d) => d.api_name === 'animate_scene');
+    if (fnIndex < 0) throw new Error('This Space no longer has the animate_scene endpoint.');
+    const data = [file(vp), seconds, file(ip), 'Character Swap', res];
+    while (data.length < cfg.dependencies[fnIndex].inputs.length) data.push(null);
+    const session = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const join = await fetch(`${space}/gradio_api/queue/join`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data, fn_index: fnIndex, trigger_id: null, session_hash: session }) });
+    if (!join.ok) throw new Error(`Space queue refused the job (${join.status}): ${(await join.text()).slice(0, 200)}`);
     setProg(40, 'In the free GPU queue… this can take several minutes. Keep this tab open.');
-    const stream = await fetch(`${space}/gradio_api/call/animate_scene/${event_id}`);
-    const reader = stream.body.getReader(); const dec = new TextDecoder(); let buf = '', ev = '', n = 0, out = null;
-    for (;;) {
-      const { value, done } = await reader.read(); if (done) break;
-      buf += dec.decode(value, { stream: true });
+    const stream = await fetch(`${space}/gradio_api/queue/data?session_hash=${session}`);
+    if (!stream.ok) throw new Error(`Space stream failed (${stream.status})`);
+    const reader = stream.body.getReader(); const dec = new TextDecoder(); let buf = '', out = null, done = false;
+    while (!done) {
+      const r = await reader.read(); if (r.done) break;
+      buf += dec.decode(r.value, { stream: true });
       let i; while ((i = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (line.startsWith('event:')) ev = line.slice(6).trim();
-        else if (line.startsWith('data:')) {
-          const d = line.slice(5).trim();
-          if (ev === 'error') throw new Error(JSON.parse(d || '{}')?.error || 'The free GPU Space returned an error (it may be out of free quota or busy). Try again later.');
-          if (ev === 'complete') { const arr = JSON.parse(d); const v = arr[0]; out = v?.url || v?.video?.url || null; }
-          if (ev === 'generating' || ev === 'heartbeat') setProg(Math.min(95, 40 + ++n), 'Rendering on the free GPU… keep this tab open.');
-        }
+        if (!line.startsWith('data:')) continue;
+        let m; try { m = JSON.parse(line.slice(5)); } catch { continue; }
+        if (m.msg === 'estimation') setProg(40, `Free GPU queue: position ${(m.rank ?? 0) + 1}${m.rank_eta ? `, about ${Math.round(m.rank_eta)}s` : ''}. Keep this tab open.`);
+        else if (m.msg === 'process_starts') setProg(45, 'Rendering on the free GPU…');
+        else if (m.msg === 'progress' && m.progress_data?.[0]) { const p = m.progress_data[0]; setProg(Math.min(94, 45 + Math.round(45 * (p.index / (p.length || 1)))), `Rendering on the free GPU… ${p.desc || 'generating'} ${p.index}/${p.length}`); }
+        else if (m.msg === 'process_completed') {
+          done = true;
+          if (!m.success) throw new Error('Hugging Face Space error: ' + (m.output?.error || m.output?.title || 'unknown error (the Space may be out of free GPU quota or busy; try a shorter clip or retry later)'));
+          const v = m.output?.data?.[0]; out = v?.url || v?.video?.url || null;
+        } else if (m.msg === 'unexpected_error' || m.msg === 'queue_full') { done = true; throw new Error('Hugging Face Space: ' + (m.message || m.msg)); }
       }
-      if (out) break;
     }
     if (!out) throw new Error('The Space finished without a video.');
     setProg(96, 'Saving your result…');

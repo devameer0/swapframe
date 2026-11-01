@@ -6,7 +6,7 @@ Recast any short clip: upload a video and a character image, and SwapFrame retur
 
 - Frontend: Vite + vanilla JS with a monochrome look (black, greys and white, Figtree font, drifting grey orbs, 20px cards). Deployed to GitHub Pages from the `gh-pages` branch with `npm run deploy`.
 - Auth, storage, database: [Supabase](https://supabase.com) (email/password, private buckets, `jobs` and `profiles` tables with RLS).
-- AI (free): the public Hugging Face Space [`alexnasa/Wan2.2-Animate-ZEROGPU`](https://huggingface.co/spaces/alexnasa/Wan2.2-Animate-ZEROGPU) running Wan 2.2 Animate. It uses the Gradio endpoint `/animate_scene` in "Character Swap" mode.
+- AI (free): the public Hugging Face Space [`alexnasa/Wan2.2-Animate-ZEROGPU`](https://huggingface.co/spaces/alexnasa/Wan2.2-Animate-ZEROGPU) running Wan 2.2 Animate. It uses the Gradio endpoint `/animate_scene` in "Character Swap" mode, called through Gradio's queue protocol (`/gradio_api/queue/join` and `/gradio_api/queue/data`). The simple `/gradio_api/call/...` API fails on this Space because it leaves out the hidden State input. No HF token is needed.
 - Optional paid fallback: Replicate [`wan-video/wan-2.2-animate-replace`](https://replicate.com/wan-video/wan-2.2-animate-replace). This is only used if you set `REPLICATE_API_TOKEN` as a Supabase function secret. That token never goes into the frontend.
 
 ## Free Space caveats (please read)
