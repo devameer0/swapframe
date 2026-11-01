@@ -187,7 +187,32 @@ async function startJob() {
 // Free path: call Hugging Face Spaces (Gradio queue API) straight from the visitor's browser so ZeroGPU quota is per visitor.
 // Primary: black-forest-labs/FLUX.2-klein-4B /infer — multi-reference edit: [photo, character] + prompt => same photo,
 // same clothes/pose/background, but the person becomes the character. Fallback: linoyts/Flux2-Klein-Face-Swap /face_swap.
-const SWAP_PROMPT = "Use image 1 as the base image and keep its background, sky, colors, lighting, framing, pose and clothes exactly unchanged. Replace only the person's head, face, hair and skin with the character from image 2. Ignore the background and clothes of image 2.";
+const SWAP_PROMPT = "Image 1 is the base photo. Keep image 1's background, clothes, outfit, pose, framing and art style exactly. Only replace the person's face, head and hair with the character's face and hairstyle from image 2. Do not use image 2's clothes or background.";
+// Character prep: remove its background in the browser (@imgly/background-removal, free, runs locally) and crop to the
+// head on a neutral grey backdrop so the edit model has no clothes/background to copy. Fallback: crop upper ~55%, centered.
+const loadImg = (b) => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = URL.createObjectURL(b); });
+async function prepCharacter(blob) {
+  const out = 640, c = document.createElement('canvas'); c.width = c.height = out; const g = c.getContext('2d');
+  g.fillStyle = '#c8c8c8'; g.fillRect(0, 0, out, out);
+  const draw = (img, x0, y0, sz) => { g.drawImage(img, x0, y0, sz, sz, 0, 0, out, out); };
+  try {
+    setProg(28, 'Isolating your character (runs in your browser)…');
+    const { removeBackground } = await import('@imgly/background-removal');
+    const cut = await loadImg(await removeBackground(blob, { output: { format: 'image/png' } }));
+    const W = cut.naturalWidth, H = cut.naturalHeight, t = document.createElement('canvas'); t.width = W; t.height = H;
+    const tg = t.getContext('2d'); tg.drawImage(cut, 0, 0); const a = tg.getImageData(0, 0, W, H).data;
+    let x0 = W, y0 = H, x1 = 0, y1 = 0;
+    for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) if (a[(y * W + x) * 4 + 3] > 128) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+    if (x1 <= x0 || y1 <= y0) throw new Error('empty mask');
+    const sz = Math.max(x1 - x0, Math.round((y1 - y0) * 0.55)), cx = (x0 + x1) / 2;
+    draw(t, cx - sz / 2, y0, sz);
+  } catch (e) {
+    console.warn('Background removal failed, cropping instead:', e);
+    const img = await loadImg(blob), W = img.naturalWidth, H = img.naturalHeight, sz = Math.min(W, Math.round(H * 0.55));
+    draw(img, (W - sz) / 2, 0, sz);
+  }
+  return new Promise((res) => c.toBlob((o) => res(o || blob), 'image/png'));
+}
 const imgSize = (f) => new Promise((res) => { const i = new Image(); i.onload = () => { res([i.naturalWidth, i.naturalHeight]); URL.revokeObjectURL(i.src); }; i.onerror = () => res([1024, 1024]); i.src = URL.createObjectURL(f); });
 // resize so the longest side is `max` (keeps the photo dominant over the character reference)
 const resizeBlob = (b, max) => new Promise((res) => { const i = new Image(); i.onload = () => { const k = max / Math.max(i.naturalWidth, i.naturalHeight);
@@ -242,7 +267,7 @@ async function runHF(jobId, st, photo) {
     w = Math.max(256, Math.round(w * k / 16) * 16); h = Math.max(256, Math.round(h * k / 16) * 16);
     let out, firstErr;
     try {
-      const [p1, c1] = await Promise.all([resizeBlob(pb, 1024), resizeBlob(ib, 640)]);
+      const [p1, c1] = await Promise.all([resizeBlob(pb, 1024), prepCharacter(ib)]);
       out = await gradioRun(st.space, st.api_name || 'infer', ([pp, ip]) => [st.prompt || SWAP_PROMPT, [{ image: pp }, { image: ip }], 'Distilled (4 steps)', 0, true, w, h, 4, 1.0, false],
         [[p1, 'photo.png'], [c1, 'character.png']], 'Full character swap');
     } catch (e) {
