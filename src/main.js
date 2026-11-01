@@ -15,12 +15,11 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<
 let session = null, pollTimer = null;
 
 const notice = configured ? '' : `<div class="notice" id="cfg-notice"><b>Backend not configured yet.</b> This is a preview of the UI.
-  Add your Supabase URL and anon key to <code>config.js</code> to enable sign up, uploads and generation. See the README.</div>`;
+  Add your Supabase URL and anon key to <code>config.js</code> to enable site settings. See the README.</div>`;
 
 function shell(body) {
   const links = session
-    ? `<a href="#/dashboard">Dashboard</a><a href="#" id="logout">Sign out</a>`
-    : `<a href="#/signin">Sign in</a><a href="#/signup">Sign up</a>`;
+    ? '' : '';
   const name = esc(S.site_name);
   const logo = S.logo_url ? `<img src="${esc(S.logo_url)}" alt=""/>${name}` : (S.site_name === 'SwapFrame' ? 'SWAP<b>FRAME</b>' : name);
   const banner = (S.maintenance_mode ? `<div class="announce">${name} is in maintenance mode — generation is paused.</div>` : '') +
@@ -126,7 +125,6 @@ function validate(photo, image) {
 }
 
 async function dashboard() {
-  if (configured && !session) { location.hash = '#/signin'; return; }
   shell(`<div class="dash">
   <div class="card"><h3>New restyle</h3><div id="me" style="color:var(--mute);font-size:13px"></div>
    <label>Your photo (JPG/PNG/WebP, ≤${S.max_upload_mb} MB)</label><input type="file" id="vid" accept="image/jpeg,image/png,image/webp"/>
@@ -138,13 +136,13 @@ async function dashboard() {
    <div class="bar"><i id="prog"></i></div><div id="stat" style="color:var(--mute);font-size:14px">Idle</div><div class="err" id="err"></div>
   </div>
   <div class="card"><h3>Result <span class="ai">AI-GENERATED</span></h3><div id="result" style="color:var(--mute)">Your recast will appear here.</div></div>
-  </div><div class="card"><h3>History</h3><div id="hist" style="color:var(--mute)">${configured ? 'Loading…' : 'Sign in to see your jobs.'}</div></div>`);
+  </div>${session ? '<div class="card"><h3>History</h3><div id="hist" style="color:var(--mute)">Loading…</div></div>' : ''}`);
   const go = $('#go'), consent = $('#consent');
-  const refresh = () => { go.disabled = !(configured && consent.checked && $('#vid').files[0] && $('#img').files[0]); };
+  const refresh = () => { go.disabled = !(consent.checked && $('#vid').files[0] && $('#img').files[0]); };
   ['#vid', '#img', '#consent'].forEach((s) => $(s).addEventListener('change', refresh));
   [['#img', '#imgprev'], ['#vid', '#vidprev']].forEach(([i, pv]) => $(i).addEventListener('change', () => { const f = $(i).files[0]; const p = $(pv); if (f) { p.src = URL.createObjectURL(f); p.hidden = false; } }));
   go.onclick = startJob;
-  if (configured) { loadHistory(); loadMe(); }
+  if (configured && session) { loadHistory(); loadMe(); }
 }
 async function loadMe() {
   const { data } = await sb.from('profiles').select('banned').eq('id', session.user.id).maybeSingle();
@@ -167,6 +165,7 @@ async function startJob() {
   if (!$('#consent').checked) { err.textContent = 'Please confirm consent.'; return; }
   const v = validate(video, image); if (v) { err.textContent = v; return; }
   $('#go').disabled = true;
+  if (!session) { setProg(25, 'Starting generation…'); return runHF(null, { space: 'https://black-forest-labs-flux-2-klein-4b.hf.space' }, video, image); }
   try {
     const uid = session.user.id, key = crypto.randomUUID();
     setProg(5, 'Uploading photo…');
@@ -232,10 +231,10 @@ const resizeBlob = (b, max) => new Promise((res) => { const i = new Image(); i.o
   const c = document.createElement('canvas'); c.width = Math.round(i.naturalWidth * k); c.height = Math.round(i.naturalHeight * k);
   c.getContext('2d').drawImage(i, 0, 0, c.width, c.height); URL.revokeObjectURL(i.src); c.toBlob((o) => res(o || b), 'image/png'); };
   i.onerror = () => res(b); i.src = URL.createObjectURL(b); });
-async function runHF(jobId, st, photo) {
+async function runHF(jobId, st, photo, charImg) {
   try {
     setProg(30, 'Sending photos to the free GPU…');
-    const [pb, ib] = await Promise.all([fetch(st.photo_url || st.video_url).then((r) => r.blob()), fetch(st.image_url).then((r) => r.blob())]);
+    const [pb, ib] = !jobId ? [photo, charImg] : await Promise.all([fetch(st.photo_url || st.video_url).then((r) => r.blob()), fetch(st.image_url).then((r) => r.blob())]);
     // keep the photo's aspect ratio, longest side 1024, multiples of 16
     let [w, h] = await imgSize(photo); const k = 1024 / Math.max(w, h);
     w = Math.max(256, Math.round(w * k / 16) * 16); h = Math.max(256, Math.round(h * k / 16) * 16);
@@ -245,10 +244,12 @@ async function runHF(jobId, st, photo) {
       out = await gradioRun(st.space, st.api_name || 'infer', ([pp, ip]) => [st.prompt || SWAP_PROMPT, [{ image: pp }, { image: ip }], 'Distilled (4 steps)', 0, true, w, h, 4, 1.0, false],
         [[p1, 'photo.png'], [c1, 'character.png']], 'Style transfer');
     } catch (e) { throw new Error(e.message + ' — the free GPU may be busy or your free quota used up. Please try again later.'); }
+    if (!jobId) { showLocalResult(out); setProg(100, 'Done'); $('#go').disabled = false; return; }
     setProg(96, 'Saving your result…');
     const { job } = await callFn({ action: 'complete', job_id: jobId, output_url: out });
     setProg(100, 'Done'); showResult(job); loadHistory(); $('#go').disabled = false;
   } catch (e) {
+    if (!jobId) { setProg(0, 'Failed'); $('#err').textContent = e.message; $('#go').disabled = false; return; }
     const r = await callFn({ action: 'fail', job_id: jobId, error: e.message }).catch(() => ({}));
     setProg(0, 'Failed'); $('#err').textContent = e.message + (r.replicate_available ? ' (A paid backup is enabled by the admin.)' : '');
     loadHistory(); $('#go').disabled = false;
@@ -281,6 +282,12 @@ async function showResult(job) {
    <p style="font-size:13px">This image is AI-generated. <a class="btn ghost" style="padding:6px 12px;margin-left:8px" href="${esc(blobUrl)}" download="${fn}">Download</a></p>`;
 }
 
+async function showLocalResult(url) {
+  const blobUrl = await fetch(url).then((r) => r.blob()).then((b) => URL.createObjectURL(b)).catch(() => url);
+  $('#result').innerHTML = `<div style="position:relative"><img src="${esc(blobUrl)}" alt="AI-generated result" style="width:100%;border-radius:10px;display:block"/>
+   <span class="ai" style="position:absolute;left:8px;top:8px">AI-GENERATED</span></div>
+   <p style="font-size:13px">This image is AI-generated. <a class="btn ghost" style="padding:6px 12px;margin-left:8px" href="${esc(blobUrl)}" download="swapframe-result.webp">Download</a></p>`;
+}
 async function loadHistory() {
   const h = $('#hist'); if (!h) return;
   const { data, error } = await sb.from('jobs').select('*').order('created_at', { ascending: false }).limit(50);
@@ -297,9 +304,8 @@ async function loadHistory() {
 function route() {
   clearTimeout(pollTimer);
   const r = location.hash.replace(/^#\/?/, '');
-  if (r === 'signup') authForm('signup'); else if (r === 'signin') authForm('signin');
-  else if (r === 'forgot') forgot();
-  else if (r === 'dashboard') dashboard(); else landing();
+  if (r !== 'dashboard') { history.replaceState(null, '', '#/dashboard'); }
+  dashboard();
   if (sb) sb.from('page_views').insert({ path: ('/' + r).slice(0, 200), user_id: session?.user?.id ?? null }).then(() => {}, () => {});
 }
 
@@ -317,8 +323,6 @@ async function loadSettings() {
   if (sb) {
     // live updates when the admin app changes settings (needs Realtime enabled on site_settings; falls back to load-time)
     sb.channel('settings').on('postgres_changes', { event: '*', schema: 'public', table: 'site_settings' }, () => loadSettings().then(route)).subscribe();
-    session = (await sb.auth.getSession()).data.session;
-    sb.auth.onAuthStateChange((_e, s) => { const changed = !!s !== !!session; session = s; if (changed) route(); });
   }
   window.addEventListener('hashchange', route); route();
 })();
