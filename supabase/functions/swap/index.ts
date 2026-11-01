@@ -1,8 +1,7 @@
 // SwapFrame `swap` edge function.
 //
-// Free path (default): Hugging Face Space alexnasa/Wan2.2-Animate-ZEROGPU (Wan 2.2 Animate, "Character Swap").
-//   ZeroGPU jobs often take 2–10+ minutes, which is longer than an Edge Function can stay alive, so the browser
-//   holds the Gradio stream and this function does the trusted parts:
+// Free path (default): Hugging Face Space linoyts/Flux2-Klein-Face-Swap (FLUX.2 Klein, endpoint /face_swap).
+//   PHOTO mode: the browser holds the Gradio queue stream (ZeroGPU quota is per visitor) and this function does the trusted parts:
 //   POST {action:"start", job_id}                -> checks ban/maintenance, returns short-lived signed input URLs
 //   POST {action:"complete", job_id, output_url} -> downloads the Space's output (hf.space only) into `results`
 //   POST {action:"fail", job_id, error}          -> marks the job failed
@@ -11,7 +10,7 @@
 //   POST {action:"status", job_id}                      -> polls Replicate and saves the output
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-const HF_SPACE_HOST = "alexnasa-wan2-2-animate-zerogpu.hf.space";
+const HF_SPACE_HOST = "linoyts-flux2-klein-face-swap.hf.space";
 const REPLICATE_MODEL = "wan-video/wan-2.2-animate-replace";
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -44,9 +43,12 @@ Deno.serve(async (req) => {
       const res = await fetch(src);
       if (!res.ok) throw new Error(`Could not download output (${res.status})`);
       const bytes = new Uint8Array(await res.arrayBuffer());
-      if (bytes.byteLength > 500 * 1024 * 1024) throw new Error("Output too large");
-      const path = `${user.id}/${job.id}.mp4`;
-      const up = await admin.storage.from("results").upload(path, bytes, { contentType: "video/mp4", upsert: true });
+      if (bytes.byteLength > 50 * 1024 * 1024) throw new Error("Output too large");
+      let ct = (res.headers.get("content-type") ?? "").split(";")[0];
+      const ext = /\.png($|\?)/i.test(src) || ct === "image/png" ? "png" : /\.jpe?g($|\?)/i.test(src) || ct === "image/jpeg" ? "jpg" : /\.mp4($|\?)/i.test(src) ? "mp4" : "webp";
+      ct = { png: "image/png", jpg: "image/jpeg", mp4: "video/mp4", webp: "image/webp" }[ext]!;
+      const path = `${user.id}/${job.id}.${ext}`;
+      const up = await admin.storage.from("results").upload(path, bytes, { contentType: ct, upsert: true });
       if (up.error) throw new Error(up.error.message);
       return path;
     };
@@ -67,7 +69,7 @@ Deno.serve(async (req) => {
         if ((count ?? 0) >= daily) return fail(`Daily limit of ${daily} swaps reached. Come back tomorrow.`, 429);
       }
       const sign = async (p: string) => (await admin.storage.from("uploads").createSignedUrl(p, 60 * 60 * 2)).data?.signedUrl;
-      const [video, character_image] = await Promise.all([sign(job.video_path), sign(job.image_path)]);
+      const [video, character_image] = await Promise.all([sign(job.source_path ?? job.video_path), sign(job.image_path)]);
       if (!video || !character_image) return fail("Could not sign upload URLs", 500);
       await admin.from("profiles").update({ usage_count: (prof.usage_count ?? 0) + 1 }).eq("id", user.id);
 
@@ -84,7 +86,7 @@ Deno.serve(async (req) => {
         return json({ job: data, provider: "replicate" });
       }
       const { data } = await patch({ prediction_id: "hf", status: "processing", error: null });
-      return json({ job: data, provider: "hf", space: `https://${HF_SPACE_HOST}`, video_url: video, image_url: character_image,
+      return json({ job: data, provider: "hf", space: `https://${HF_SPACE_HOST}`, photo_url: video, video_url: video, image_url: character_image,
         replicate_available: !!replicateToken });
     }
 

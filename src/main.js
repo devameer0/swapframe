@@ -8,8 +8,7 @@ const configured = !!cfg.SUPABASE_URL && !!cfg.SUPABASE_ANON_KEY &&
 const sb = configured ? createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY) : null;
 
 let S = { ...DEFAULTS };
-const LIMITS = { maxBytes: 100 * 1024 * 1024, minSec: 10, maxSec: 30, maxImg: 10 * 1024 * 1024,
-  video: ['video/mp4', 'video/quicktime', 'video/webm'], image: ['image/png', 'image/jpeg', 'image/webp'] };
+const LIMITS = { maxBytes: 15 * 1024 * 1024, maxImg: 15 * 1024 * 1024, image: ['image/png', 'image/jpeg', 'image/webp'] };
 const app = document.getElementById('app');
 const $ = (s) => app.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -41,45 +40,88 @@ function landing() {
   <div class="grid">${(S.sections || []).map((c) => `<div class="card"><h3>${esc(c.title)}</h3><p>${esc(c.text)}</p></div>`).join('')}</div>`);
 }
 
+const USER_RE = /^[A-Za-z0-9_]{3,20}$/;
+async function toEmail(id) {
+  if (id.includes('@')) return id;
+  const { data, error } = await sb.rpc('email_for_username', { u: id });
+  if (error) throw error; if (!data) throw new Error('No account with that username.');
+  return data;
+}
+
 function authForm(mode) {
   const up = mode === 'signup';
   if (up && !S.signups_open) { shell(`<div class="form card"><h2>Sign-ups are closed</h2><p style="color:var(--mute)">New accounts are paused right now. Already registered? <a href="#/signin">Sign in</a>.</p></div>`); return; }
   shell(`<form class="form card" id="f"><h2>${up ? 'Create account' : 'Welcome back'}</h2>
-   <label>Email</label><input type="email" id="email" required autocomplete="email"/>
+   ${up ? `<label>Username</label><input type="text" id="un" required minlength="3" maxlength="20" pattern="[A-Za-z0-9_]{3,20}" autocomplete="username"/><div id="unmsg" style="font-size:13px;color:var(--mute)">3–20 letters, numbers or _</div>
+   <label>Email</label><input type="email" id="email" required autocomplete="email"/>`
+   : `<label>Username or email</label><input type="text" id="email" required autocomplete="username"/>`}
    <label>Password</label><input type="password" id="pw" required minlength="8" autocomplete="${up ? 'new-password' : 'current-password'}"/>
    <p style="margin-top:18px"><button class="btn" ${configured ? '' : 'disabled'}>${up ? 'Sign up' : 'Sign in'}</button></p>
    <div class="err" id="msg"></div>
-   <p style="color:var(--mute);font-size:14px">${up ? 'Already have an account? <a href="#/signin">Sign in</a>' : 'New here? <a href="#/signup">Create an account</a>'}</p></form>`);
+   <p style="color:var(--mute);font-size:14px">${up ? 'Already have an account? <a href="#/signin">Sign in</a>' : 'New here? <a href="#/signup">Create an account</a> · <a href="#/forgot">Forgot password?</a>'}</p></form>`);
+  let unOk = false;
+  if (up) {
+    let t; $('#un').oninput = () => { clearTimeout(t); const v = $('#un').value.trim(), m = $('#unmsg'); unOk = false;
+      if (!USER_RE.test(v)) { m.style.color = 'var(--mute)'; m.textContent = '3–20 letters, numbers or _'; return; }
+      t = setTimeout(async () => { if (!sb) return; const { data } = await sb.rpc('username_available', { u: v });
+        if ($('#un').value.trim() !== v) return; unOk = !!data; m.style.color = data ? 'var(--ok,#7ee787)' : 'var(--bad)'; m.textContent = data ? 'Username available' : 'Username taken'; }, 300); };
+  }
   $('#f').onsubmit = async (e) => {
     e.preventDefault(); const msg = $('#msg'); msg.className = 'err'; msg.textContent = '';
     if (!sb) { msg.textContent = 'Backend not configured yet.'; return; }
-    const email = $('#email').value.trim(), password = $('#pw').value;
-    const { data, error } = up ? await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.href.split('#')[0] + '#/dashboard' } })
-      : await sb.auth.signInWithPassword({ email, password });
-    if (error) { msg.textContent = error.message; return; }
-    if (up && !data.session) { msg.className = 'err ok'; msg.textContent = 'Check your inbox to confirm your email, then sign in.'; return; }
-    location.hash = '#/dashboard';
+    const id = $('#email').value.trim(), password = $('#pw').value;
+    try {
+      if (up) {
+        const username = $('#un').value.trim();
+        if (!USER_RE.test(username)) throw new Error('Username must be 3–20 letters, numbers or _.');
+        const { data: free } = await sb.rpc('username_available', { u: username }); if (!free) throw new Error('Username taken.');
+        const { data, error } = await sb.auth.signUp({ email: id, password, options: { data: { username }, emailRedirectTo: location.href.split('#')[0] + '#/dashboard' } });
+        if (error) throw error;
+        if (!data.session) { msg.className = 'err ok'; msg.textContent = 'Check your inbox to confirm your email, then sign in.'; return; }
+      } else {
+        const { error } = await sb.auth.signInWithPassword({ email: await toEmail(id), password }); if (error) throw error;
+      }
+      location.hash = '#/dashboard';
+    } catch (er) { msg.textContent = er.message; }
   };
 }
 
-function videoDuration(file) {
-  return new Promise((res, rej) => {
-    const v = document.createElement('video'); v.preload = 'metadata';
-    v.onloadedmetadata = () => { URL.revokeObjectURL(v.src); res(v.duration); };
-    v.onerror = () => rej(new Error('Could not read video'));
-    v.src = URL.createObjectURL(file);
-  });
+function forgot() {
+  shell(`<form class="form card" id="f"><h2>Reset password</h2><p style="color:var(--mute);font-size:14px">We'll email you a 6-digit code.</p>
+   <label>Username or email</label><input type="text" id="id" required/>
+   <p style="margin-top:18px"><button class="btn" ${configured ? '' : 'disabled'}>Send code</button></p><div class="err" id="msg"></div>
+   <p style="color:var(--mute);font-size:14px"><a href="#/signin">Back to sign in</a></p></form>`);
+  $('#f').onsubmit = async (e) => {
+    e.preventDefault(); const msg = $('#msg'); msg.className = 'err'; msg.textContent = '';
+    try {
+      const email = await toEmail($('#id').value.trim());
+      const { error } = await sb.auth.resetPasswordForEmail(email); if (error) throw error;
+      resetCode(email);
+    } catch (er) { msg.textContent = er.message; }
+  };
+}
+function resetCode(email) {
+  shell(`<form class="form card" id="f"><h2>Enter your code</h2><p style="color:var(--mute);font-size:14px">If an account exists, a 6-digit code was sent to ${esc(email.replace(/^(.).*(@.*)$/, '$1•••$2'))}.</p>
+   <label>6-digit code</label><input type="text" id="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"/>
+   <label>New password</label><input type="password" id="pw" required minlength="8" autocomplete="new-password"/>
+   <p style="margin-top:18px"><button class="btn">Set new password</button></p><div class="err" id="msg"></div></form>`);
+  $('#f').onsubmit = async (e) => {
+    e.preventDefault(); const msg = $('#msg'); msg.className = 'err'; msg.textContent = '';
+    try {
+      const { error } = await sb.auth.verifyOtp({ email, token: $('#code').value.trim(), type: 'recovery' }); if (error) throw error;
+      const r = await sb.auth.updateUser({ password: $('#pw').value }); if (r.error) throw r.error;
+      msg.className = 'err ok'; msg.textContent = 'Password updated.'; setTimeout(() => { location.hash = '#/dashboard'; }, 800);
+    } catch (er) { msg.textContent = er.message; }
+  };
 }
 
-async function validate(video, image) {
-  if (!video) return 'Choose a video.';
-  if (!LIMITS.video.includes(video.type)) return 'Video must be MP4, MOV or WebM.';
-  if (video.size > LIMITS.maxBytes) return `Video must be ${S.max_upload_mb} MB or smaller.`;
-  const d = await videoDuration(video).catch(() => NaN);
-  if (!(d >= LIMITS.minSec && d <= LIMITS.maxSec)) return `Video must be ${LIMITS.minSec}–${LIMITS.maxSec} seconds (yours: ${isNaN(d) ? 'unknown' : d.toFixed(1) + 's'}).`;
+function validate(photo, image) {
+  if (!photo) return 'Choose a photo.';
+  if (!LIMITS.image.includes(photo.type)) return 'Photo must be JPG, PNG or WebP.';
+  if (photo.size > LIMITS.maxBytes) return `Photo must be ${S.max_upload_mb} MB or smaller.`;
   if (!image) return 'Choose a character image.';
-  if (!LIMITS.image.includes(image.type)) return 'Image must be PNG, JPG or WebP.';
-  if (image.size > LIMITS.maxImg) return 'Image must be 10 MB or smaller.';
+  if (!LIMITS.image.includes(image.type)) return 'Character image must be PNG, JPG or WebP.';
+  if (image.size > LIMITS.maxImg) return 'Character image must be 15 MB or smaller.';
   return null;
 }
 
@@ -87,11 +129,11 @@ async function dashboard() {
   if (configured && !session) { location.hash = '#/signin'; return; }
   shell(`<div class="dash">
   <div class="card"><h3>New recast</h3><div id="me" style="color:var(--mute);font-size:13px"></div>
-   <label>Source video (${LIMITS.minSec}–${LIMITS.maxSec}s, ≤${S.max_upload_mb} MB, MP4/MOV/WebM)</label><input type="file" id="vid" accept="video/mp4,video/quicktime,video/webm"/>
-   <label>Character image (PNG/JPG/WebP, ≤10 MB)</label><input type="file" id="img" accept="image/png,image/jpeg,image/webp"/>
+   <label>Source photo (JPG/PNG/WebP, ≤${S.max_upload_mb} MB)</label><input type="file" id="vid" accept="image/jpeg,image/png,image/webp"/>
+   <img id="vidprev" class="preview" hidden alt="photo preview"/>
+   <label>Character image (PNG/JPG/WebP, ≤15 MB)</label><input type="file" id="img" accept="image/png,image/jpeg,image/webp"/>
    <img id="imgprev" class="preview" hidden alt="character preview"/>
-   <label>Quality</label><select id="res"><option value="low">Standard (faster)</option><option value="high">High (slower)</option></select>
-   <label class="check" style="margin-top:16px"><input type="checkbox" id="consent"/><span>I own or have permission to use this video and character; no real person's likeness without consent.</span></label>
+   <label class="check" style="margin-top:16px"><input type="checkbox" id="consent"/><span>I own or have permission to use this photo and character; no real person's likeness without consent.</span></label>
    <p style="margin-top:16px"><button class="btn" id="go" disabled>Generate</button></p>
    <div class="bar"><i id="prog"></i></div><div id="stat" style="color:var(--mute);font-size:14px">Idle</div><div class="err" id="err"></div>
   </div>
@@ -100,7 +142,7 @@ async function dashboard() {
   const go = $('#go'), consent = $('#consent');
   const refresh = () => { go.disabled = !(configured && consent.checked && $('#vid').files[0] && $('#img').files[0]); };
   ['#vid', '#img', '#consent'].forEach((s) => $(s).addEventListener('change', refresh));
-  $('#img').addEventListener('change', () => { const f = $('#img').files[0]; const p = $('#imgprev'); if (f) { p.src = URL.createObjectURL(f); p.hidden = false; } });
+  [['#img', '#imgprev'], ['#vid', '#vidprev']].forEach(([i, pv]) => $(i).addEventListener('change', () => { const f = $(i).files[0]; const p = $(pv); if (f) { p.src = URL.createObjectURL(f); p.hidden = false; } }));
   go.onclick = startJob;
   if (configured) { loadHistory(); loadMe(); }
 }
@@ -123,52 +165,52 @@ async function startJob() {
   const err = $('#err'); err.textContent = '';
   const video = $('#vid').files[0], image = $('#img').files[0];
   if (!$('#consent').checked) { err.textContent = 'Please confirm consent.'; return; }
-  const v = await validate(video, image); if (v) { err.textContent = v; return; }
+  const v = validate(video, image); if (v) { err.textContent = v; return; }
   $('#go').disabled = true;
   try {
     const uid = session.user.id, key = crypto.randomUUID();
-    setProg(5, 'Uploading video…');
-    const vp = `${uid}/${key}-video.${ext(video)}`, ip = `${uid}/${key}-character.${ext(image)}`;
+    setProg(5, 'Uploading photo…');
+    const vp = `${uid}/${key}-photo.${ext(video)}`, ip = `${uid}/${key}-character.${ext(image)}`;
     let r = await sb.storage.from('uploads').upload(vp, video, { contentType: video.type }); if (r.error) throw r.error;
     setProg(15, 'Uploading character…');
     r = await sb.storage.from('uploads').upload(ip, image, { contentType: image.type }); if (r.error) throw r.error;
     const { data: job, error } = await sb.from('jobs').insert({ user_id: uid, video_path: vp, image_path: ip, consent: true }).select().single();
     if (error) throw error;
     setProg(25, 'Starting generation…');
-    const dur = await videoDuration(video).catch(() => 10);
     const st = await callFn({ action: 'start', job_id: job.id });
     loadHistory();
     if (st.provider === 'replicate') { poll(job.id); return; }
-    await runHF(job.id, st, dur, $('#res').value === 'high' ? 'Medium Res' : 'Low Res');
+    await runHF(job.id, st, video);
   } catch (e) { err.textContent = e.message || String(e); setProg(0, 'Failed'); $('#go').disabled = false; }
 }
 
-// Free path: call the Hugging Face Space (Gradio HTTP API) straight from the browser, because ZeroGPU jobs
-// can run longer than an Edge Function stays alive. The edge function then stores the result.
-async function runHF(jobId, st, dur, res) {
+// Free path: call the Hugging Face Space (Gradio queue API) straight from the visitor's browser so ZeroGPU quota
+// is per visitor. Space: linoyts/Flux2-Klein-Face-Swap, endpoint /face_swap (reference_face, target_image, ...).
+const imgSize = (f) => new Promise((res) => { const i = new Image(); i.onload = () => { res([i.naturalWidth, i.naturalHeight]); URL.revokeObjectURL(i.src); }; i.onerror = () => res([1024, 1024]); i.src = URL.createObjectURL(f); });
+async function runHF(jobId, st, photo) {
   const space = st.space;
   try {
-    setProg(30, 'Sending files to the free GPU…');
+    setProg(30, 'Sending photos to the free GPU…');
     const fd = new FormData();
-    const [vb, ib] = await Promise.all([fetch(st.video_url).then((r) => r.blob()), fetch(st.image_url).then((r) => r.blob())]);
-    fd.append('files', vb, 'video.mp4'); fd.append('files', ib, 'character.png');
+    const [pb, ib] = await Promise.all([fetch(st.photo_url || st.video_url).then((r) => r.blob()), fetch(st.image_url).then((r) => r.blob())]);
+    fd.append('files', pb, 'photo.' + (pb.type.split('/')[1] || 'png')); fd.append('files', ib, 'character.' + (ib.type.split('/')[1] || 'png'));
     const upRes = await fetch(`${space}/gradio_api/upload`, { method: 'POST', body: fd });
-    if (!upRes.ok) throw new Error(`Space upload failed (${upRes.status})`);
-    const [vp, ip] = await upRes.json();
+    if (!upRes.ok) throw new Error(`Space upload failed (${upRes.status}): ${(await upRes.text()).slice(0, 200)}`);
+    const [pp, ip] = await upRes.json();
     const file = (path) => ({ path, meta: { _type: 'gradio.FileData' } });
-    const seconds = Math.max(2, Math.min(20, Math.floor(dur)));
-    // Use Gradio's queue protocol (what the Space's own UI and gradio_client use). The simple /call API
-    // fails on this Space because it omits the hidden State input, so look up the endpoint and pad inputs.
+    // keep the photo's aspect ratio, longest side 1024, multiples of 16
+    let [w, h] = await imgSize(photo); const k = 1024 / Math.max(w, h);
+    w = Math.max(256, Math.round(w * k / 16) * 16); h = Math.max(256, Math.round(h * k / 16) * 16);
     const cfg = await fetch(`${space}/config`).then((r) => r.json());
-    const fnIndex = cfg.dependencies.findIndex((d) => d.api_name === 'animate_scene');
-    if (fnIndex < 0) throw new Error('This Space no longer has the animate_scene endpoint.');
-    const data = [file(vp), seconds, file(ip), 'Character Swap', res];
+    const fnIndex = cfg.dependencies.findIndex((d) => d.api_name === 'face_swap');
+    if (fnIndex < 0) throw new Error('This Space no longer has the face_swap endpoint.');
+    const data = [file(ip), file(pp), 0, true, w, h, 4, 1.0];
     while (data.length < cfg.dependencies[fnIndex].inputs.length) data.push(null);
     const session = Math.random().toString(36).slice(2) + Date.now().toString(36);
     const join = await fetch(`${space}/gradio_api/queue/join`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data, fn_index: fnIndex, trigger_id: null, session_hash: session }) });
     if (!join.ok) throw new Error(`Space queue refused the job (${join.status}): ${(await join.text()).slice(0, 200)}`);
-    setProg(40, 'In the free GPU queue… this can take several minutes. Keep this tab open.');
+    setProg(40, 'In the free GPU queue… usually under a minute. Keep this tab open.');
     const stream = await fetch(`${space}/gradio_api/queue/data?session_hash=${session}`);
     if (!stream.ok) throw new Error(`Space stream failed (${stream.status})`);
     const reader = stream.body.getReader(); const dec = new TextDecoder(); let buf = '', out = null, done = false;
@@ -180,16 +222,17 @@ async function runHF(jobId, st, dur, res) {
         if (!line.startsWith('data:')) continue;
         let m; try { m = JSON.parse(line.slice(5)); } catch { continue; }
         if (m.msg === 'estimation') setProg(40, `Free GPU queue: position ${(m.rank ?? 0) + 1}${m.rank_eta ? `, about ${Math.round(m.rank_eta)}s` : ''}. Keep this tab open.`);
-        else if (m.msg === 'process_starts') setProg(45, 'Rendering on the free GPU…');
-        else if (m.msg === 'progress' && m.progress_data?.[0]) { const p = m.progress_data[0]; setProg(Math.min(94, 45 + Math.round(45 * (p.index / (p.length || 1)))), `Rendering on the free GPU… ${p.desc || 'generating'} ${p.index}/${p.length}`); }
+        else if (m.msg === 'process_starts') setProg(50, 'Rendering on the free GPU…');
+        else if (m.msg === 'progress' && m.progress_data?.[0]) { const p = m.progress_data[0]; setProg(Math.min(94, 50 + Math.round(40 * (p.index / (p.length || 1)))), `Rendering… ${p.desc || ''} ${p.index}/${p.length}`); }
         else if (m.msg === 'process_completed') {
           done = true;
-          if (!m.success) throw new Error('Hugging Face Space error: ' + (m.output?.error || m.output?.title || 'unknown error (the Space may be out of free GPU quota or busy; try a shorter clip or retry later)'));
-          const v = m.output?.data?.[0]; out = v?.url || v?.video?.url || null;
+          if (!m.success) throw new Error('Hugging Face Space error: ' + ([m.output?.title, m.output?.error].filter(Boolean).join(' — ') || 'unknown error (the Space may be busy or out of free GPU quota; retry later)'));
+          const v = m.output?.data?.[0]; const pick = Array.isArray(v) ? v[v.length - 1] : v; // ImageSlider returns [before, after]
+          out = pick?.url || pick?.image?.url || null;
         } else if (m.msg === 'unexpected_error' || m.msg === 'queue_full') { done = true; throw new Error('Hugging Face Space: ' + (m.message || m.msg)); }
       }
     }
-    if (!out) throw new Error('The Space finished without a video.');
+    if (!out) throw new Error('The Space finished without an image.');
     setProg(96, 'Saving your result…');
     const { job } = await callFn({ action: 'complete', job_id: jobId, output_url: out });
     setProg(100, 'Done'); showResult(job); loadHistory(); $('#go').disabled = false;
@@ -219,8 +262,11 @@ async function signedResult(path) {
 }
 async function showResult(job) {
   const url = await signedResult(job.output_path); if (!url) return;
-  $('#result').innerHTML = `<video src="${esc(url)}" controls playsinline></video>
-   <p style="font-size:13px">This video is AI-generated. <a class="btn ghost" style="padding:6px 12px;margin-left:8px" href="${esc(url)}" download="swapframe-${esc(job.id)}.mp4">Download</a></p>`;
+  const isVid = /\.mp4$/.test(job.output_path || ''), fn = `swapframe-${esc(job.id)}.${(job.output_path || '').split('.').pop() || 'webp'}`;
+  const blobUrl = await fetch(url).then((r) => r.blob()).then((b) => URL.createObjectURL(b)).catch(() => url);
+  $('#result').innerHTML = `<div style="position:relative">${isVid ? `<video src="${esc(url)}" controls playsinline></video>` : `<img src="${esc(url)}" alt="AI-generated result" style="width:100%;border-radius:10px;display:block"/>`}
+   <span class="ai" style="position:absolute;left:8px;top:8px">AI-GENERATED</span></div>
+   <p style="font-size:13px">This image is AI-generated. <a class="btn ghost" style="padding:6px 12px;margin-left:8px" href="${esc(blobUrl)}" download="${fn}">Download</a></p>`;
 }
 
 async function loadHistory() {
@@ -228,9 +274,10 @@ async function loadHistory() {
   const { data, error } = await sb.from('jobs').select('*').order('created_at', { ascending: false }).limit(50);
   if (error) { h.textContent = error.message; return; }
   if (!data.length) { h.textContent = 'No jobs yet.'; return; }
-  h.innerHTML = `<table><tr><th>Created</th><th>Status</th><th></th></tr>${data.map((j) => `<tr><td>${esc(new Date(j.created_at).toLocaleString())}</td>
+  h.innerHTML = `<table><tr><th>Created</th><th></th><th>Status</th><th></th></tr>${data.map((j) => `<tr><td>${esc(new Date(j.created_at).toLocaleString())}</td><td>${j.output_path && !/\.mp4$/.test(j.output_path) ? `<img data-thumb="${esc(j.output_path)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:6px"/>` : ''}</td>
    <td><span class="pill ${esc(j.status)}">${esc(j.status)}</span></td><td>${j.status === 'succeeded' ? `<a href="#" data-view="${esc(j.id)}">View</a>`
    : ['queued', 'starting', 'processing'].includes(j.status) && String(j.prediction_id || '').startsWith('replicate:') ? `<a href="#" data-poll="${esc(j.id)}">Track</a>` : esc(j.error || '')}</td></tr>`).join('')}</table>`;
+  h.querySelectorAll('[data-thumb]').forEach(async (im) => { const u = await signedResult(im.dataset.thumb); if (u) im.src = u; });
   h.querySelectorAll('[data-view]').forEach((a) => a.onclick = (e) => { e.preventDefault(); showResult(data.find((j) => j.id === a.dataset.view)); });
   h.querySelectorAll('[data-poll]').forEach((a) => a.onclick = (e) => { e.preventDefault(); poll(a.dataset.poll); });
 }
@@ -239,7 +286,9 @@ function route() {
   clearTimeout(pollTimer);
   const r = location.hash.replace(/^#\/?/, '');
   if (r === 'signup') authForm('signup'); else if (r === 'signin') authForm('signin');
+  else if (r === 'forgot') forgot();
   else if (r === 'dashboard') dashboard(); else landing();
+  if (sb) sb.from('page_views').insert({ path: ('/' + r).slice(0, 200), user_id: session?.user?.id ?? null }).then(() => {}, () => {});
 }
 
 async function loadSettings() {
@@ -247,7 +296,7 @@ async function loadSettings() {
     const { data } = await sb.from('site_settings').select('data').eq('id', 1).maybeSingle();
     if (data?.data) S = { ...DEFAULTS, ...data.data };
   }
-  LIMITS.maxBytes = Number(S.max_upload_mb) * 1024 * 1024; LIMITS.minSec = Number(S.min_seconds); LIMITS.maxSec = Number(S.max_seconds);
+  LIMITS.maxBytes = Math.min(15, Number(S.max_upload_mb) || 15) * 1024 * 1024; S.max_upload_mb = LIMITS.maxBytes / 1048576;
   applyTheme(S);
 }
 

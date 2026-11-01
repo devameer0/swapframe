@@ -2,27 +2,25 @@
 export const DEFAULTS = {
   site_name: 'SwapFrame',
   logo_url: '',
-  tagline: '// RECAST ANY CLIP',
+  tagline: '// RECAST ANY PHOTO',
   hero_title: 'Your character.',
-  hero_highlight: 'Their every move.',
-  hero_text: 'Upload a short video and a character image. SwapFrame replaces the person on screen with your character while keeping the original motion, camera and background.',
+  hero_highlight: 'Their exact shot.',
+  hero_text: 'Upload a photo and a character image. SwapFrame puts your character into the shot while keeping the original pose, background and lighting.',
   cta_text: 'Get started',
   announcement: '',
   sections: [
-    { title: '01 · Drop a clip', text: 'MP4, MOV or WebM, 2–20 seconds, up to 100 MB. Short clips render fastest.' },
-    { title: '02 · Pick a character', text: 'A clear PNG, JPG or WebP of the character you want in the shot.' },
-    { title: '03 · Get the recast', text: 'Same motion and framing, new performer. Download it or find it in your history.' },
+    { title: '01 · Drop a photo', text: 'JPG, PNG or WebP, up to 15 MB. A clear, front-facing person works best.' },
+    { title: '02 · Pick a character', text: 'A clear PNG, JPG or WebP of the character whose face you want in the shot.' },
+    { title: '03 · Get the recast', text: 'Same pose and framing, new character. Download it or find it in your history.' },
   ],
-  footer_text: 'Outputs are AI-generated. Only use footage and characters you own or have permission to use.',
+  footer_text: 'Outputs are AI-generated. Only use photos and characters you own or have permission to use.',
   footer_links: [{ label: 'GitHub', url: 'https://github.com/devameer0/swapframe' }],
   theme: 'dark',
   primary: '#ffffff',
   accent: '#a6a6a6',
   font: 'figtree',
   background: '',
-  max_upload_mb: 100,
-  min_seconds: 2,
-  max_seconds: 20, // the free HF Space renders at most 20s
+  max_upload_mb: 15,
   daily_limit: 0, // 0 = unlimited (SwapFrame is free for everyone)
   signups_open: true,
   maintenance_mode: false,
@@ -49,5 +47,5 @@ export function applyTheme(s) {
   r.setProperty('--acc2', s.accent || DEFAULTS.accent);
   r.setProperty('--font', FONTS[s.font] || FONTS.figtree);
   r.setProperty('--bgimg', s.background ? (/^(https?:|data:)/.test(s.background) ? `url("${s.background.replace(/"/g, '')}") center/cover fixed` : s.background) : 'none');
-  document.title = `${s.site_name} — recast any clip`;
+  document.title = `${s.site_name} — recast any photo`;
 }
