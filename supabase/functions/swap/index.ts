@@ -1,11 +1,18 @@
-// SwapFrame edge function.
-// POST {action:"start", job_id}  -> creates a Replicate prediction for the job
-// POST {action:"status", job_id} -> polls Replicate, saves output to the results bucket when done
-// Secrets: REPLICATE_API_TOKEN (set with `supabase secrets set`). SUPABASE_URL / SUPABASE_ANON_KEY /
-// SUPABASE_SERVICE_ROLE_KEY are injected automatically by Supabase.
+// SwapFrame `swap` edge function.
+//
+// Free path (default): Hugging Face Space alexnasa/Wan2.2-Animate-ZEROGPU (Wan 2.2 Animate, "Character Swap").
+//   ZeroGPU jobs often take 2–10+ minutes, which is longer than an Edge Function can stay alive, so the browser
+//   holds the Gradio stream and this function does the trusted parts:
+//   POST {action:"start", job_id}                -> checks ban/maintenance, returns short-lived signed input URLs
+//   POST {action:"complete", job_id, output_url} -> downloads the Space's output (hf.space only) into `results`
+//   POST {action:"fail", job_id, error}          -> marks the job failed
+// Optional paid fallback (only if the REPLICATE_API_TOKEN secret is set):
+//   POST {action:"start", job_id, provider:"replicate"} -> Replicate wan-video/wan-2.2-animate-replace
+//   POST {action:"status", job_id}                      -> polls Replicate and saves the output
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-const MODEL = "wan-video/wan-2.2-animate-replace"; // https://replicate.com/wan-video/wan-2.2-animate-replace
+const HF_SPACE_HOST = "alexnasa-wan2-2-animate-zerogpu.hf.space";
+const REPLICATE_MODEL = "wan-video/wan-2.2-animate-replace";
 const cors = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -17,9 +24,8 @@ const json = (b: unknown, s = 200) =>
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
-    const token = Deno.env.get("REPLICATE_API_TOKEN");
-    if (!token) return json({ error: "REPLICATE_API_TOKEN secret is not set" }, 500);
     const url = Deno.env.get("SUPABASE_URL")!;
+    const replicateToken = Deno.env.get("REPLICATE_API_TOKEN") ?? "";
     const userClient = createClient(url, Deno.env.get("SUPABASE_ANON_KEY")!, {
       global: { headers: { Authorization: req.headers.get("Authorization") ?? "" } },
     });
@@ -27,80 +33,96 @@ Deno.serve(async (req) => {
     if (!user) return json({ error: "Not signed in" }, 401);
     const admin = createClient(url, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
-    const { action, job_id, resolution } = await req.json();
+    const { action, job_id, provider, output_url, error: clientError } = await req.json();
     const { data: job } = await admin.from("jobs").select("*").eq("id", job_id).eq("user_id", user.id).single();
     if (!job) return json({ error: "Job not found" }, 404);
+    const patch = (p: Record<string, unknown>) =>
+      admin.from("jobs").update({ ...p, updated_at: new Date().toISOString() }).eq("id", job.id).select().single();
+    const fail = async (msg: string, code: number) => { await patch({ status: "failed", error: msg }); return json({ error: msg }, code); };
+
+    const saveOutput = async (src: string) => {
+      const res = await fetch(src);
+      if (!res.ok) throw new Error(`Could not download output (${res.status})`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.byteLength > 500 * 1024 * 1024) throw new Error("Output too large");
+      const path = `${user.id}/${job.id}.mp4`;
+      const up = await admin.storage.from("results").upload(path, bytes, { contentType: "video/mp4", upsert: true });
+      if (up.error) throw new Error(up.error.message);
+      return path;
+    };
 
     if (action === "start") {
-      if (job.prediction_id) return json({ job });
-      const { data: prof } = await admin.from("profiles").select("banned,credits,usage_count").eq("id", user.id).single();
-      if (!prof || prof.banned) {
-        await admin.from("jobs").update({ status: "failed", error: "Account banned", updated_at: new Date() }).eq("id", job.id);
-        return json({ error: "Your account is banned" }, 403);
-      }
+      if (["succeeded", "failed", "canceled"].includes(job.status)) return json({ job });
+      const { data: prof } = await admin.from("profiles").select("banned,role,usage_count").eq("id", user.id).single();
+      if (!prof || prof.banned) return fail("Your account is banned", 403);
       const { data: st } = await admin.from("site_settings").select("data").eq("id", 1).single();
       const settings = st?.data ?? {};
-      const { data: me } = await admin.from("profiles").select("role").eq("id", user.id).single();
-      if (settings.maintenance_mode && me?.role !== "admin") {
-        await admin.from("jobs").update({ status: "failed", error: "Maintenance mode", updated_at: new Date() }).eq("id", job.id);
-        return json({ error: "SwapFrame is in maintenance mode. Try again later." }, 503);
+      if (settings.maintenance_mode && prof.role !== "admin") return fail("SwapFrame is in maintenance mode. Try again later.", 503);
+      // Optional daily cap, disabled by default (0 = unlimited; SwapFrame is free for everyone).
+      const daily = Number(settings.daily_limit ?? 0);
+      if (daily > 0 && prof.role !== "admin") {
+        const since = new Date(); since.setUTCHours(0, 0, 0, 0);
+        const { count } = await admin.from("jobs").select("id", { count: "exact", head: true })
+          .eq("user_id", user.id).not("prediction_id", "is", null).gte("created_at", since.toISOString());
+        if ((count ?? 0) >= daily) return fail(`Daily limit of ${daily} swaps reached. Come back tomorrow.`, 429);
       }
-      const daily = Number(settings.daily_limit ?? 3);
-      const since = new Date(); since.setUTCHours(0, 0, 0, 0);
-      const { count } = await admin.from("jobs").select("id", { count: "exact", head: true })
-        .eq("user_id", user.id).not("prediction_id", "is", null).gte("created_at", since.toISOString());
-      if (daily > 0 && (count ?? 0) >= daily && me?.role !== "admin") {
-        await admin.from("jobs").update({ status: "failed", error: "Daily limit reached", updated_at: new Date() }).eq("id", job.id);
-        return json({ error: `Daily limit of ${daily} swaps reached. Come back tomorrow.` }, 429);
-      }
-      if (prof.credits <= 0) {
-        await admin.from("jobs").update({ status: "failed", error: "No credits left", updated_at: new Date() }).eq("id", job.id);
-        return json({ error: "No credits left. Ask the admin for more." }, 402);
-      }
-      const sign = async (p: string) =>
-        (await admin.storage.from("uploads").createSignedUrl(p, 60 * 60 * 2)).data?.signedUrl;
+      const sign = async (p: string) => (await admin.storage.from("uploads").createSignedUrl(p, 60 * 60 * 2)).data?.signedUrl;
       const [video, character_image] = await Promise.all([sign(job.video_path), sign(job.image_path)]);
-      if (!video || !character_image) return json({ error: "Could not sign upload URLs" }, 500);
-      const r = await fetch(`https://api.replicate.com/v1/models/${MODEL}/predictions`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: { video, character_image, resolution: resolution === "480" ? "480" : "720", merge_audio: true, go_fast: true },
-        }),
-      });
-      const p = await r.json();
-      if (!r.ok) {
-        await admin.from("jobs").update({ status: "failed", error: p.detail ?? "Replicate error", updated_at: new Date() }).eq("id", job.id);
-        return json({ error: p.detail ?? "Replicate error" }, 502);
+      if (!video || !character_image) return fail("Could not sign upload URLs", 500);
+      await admin.from("profiles").update({ usage_count: (prof.usage_count ?? 0) + 1 }).eq("id", user.id);
+
+      if (provider === "replicate") {
+        if (!replicateToken) return json({ error: "Replicate fallback is not enabled" }, 400);
+        const r = await fetch(`https://api.replicate.com/v1/models/${REPLICATE_MODEL}/predictions`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${replicateToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ input: { video, character_image, resolution: "480", merge_audio: true, go_fast: true } }),
+        });
+        const p = await r.json();
+        if (!r.ok) return fail(p.detail ?? "Replicate error", 502);
+        const { data } = await patch({ prediction_id: `replicate:${p.id}`, status: "processing", error: null });
+        return json({ job: data, provider: "replicate" });
       }
-      await admin.from("profiles").update({ credits: prof.credits - 1, usage_count: prof.usage_count + 1 }).eq("id", user.id);
-      const { data } = await admin.from("jobs")
-        .update({ prediction_id: p.id, status: p.status ?? "starting", updated_at: new Date() })
-        .eq("id", job.id).select().single();
-      return json({ job: data });
+      const { data } = await patch({ prediction_id: "hf", status: "processing", error: null });
+      return json({ job: data, provider: "hf", space: `https://${HF_SPACE_HOST}`, video_url: video, image_url: character_image,
+        replicate_available: !!replicateToken });
+    }
+
+    if (action === "complete") {
+      if (job.status === "succeeded") return json({ job });
+      let u: URL;
+      try { u = new URL(String(output_url)); } catch { return json({ error: "Bad output URL" }, 400); }
+      if (u.protocol !== "https:" || u.hostname !== HF_SPACE_HOST) return json({ error: "Output must come from the SwapFrame HF Space" }, 400);
+      try {
+        const path = await saveOutput(u.toString());
+        const { data } = await patch({ status: "succeeded", output_path: path, error: null });
+        return json({ job: data });
+      } catch (e) { return fail(String((e as Error).message), 502); }
+    }
+
+    if (action === "fail") {
+      if (job.status === "succeeded") return json({ job });
+      const { data } = await patch({ status: "failed", error: String(clientError ?? "Generation failed").slice(0, 500) });
+      return json({ job: data, replicate_available: !!replicateToken });
     }
 
     if (action === "status") {
-      if (!job.prediction_id || ["succeeded", "failed", "canceled"].includes(job.status)) return json({ job });
-      const r = await fetch(`https://api.replicate.com/v1/predictions/${job.prediction_id}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const pid = String(job.prediction_id ?? "");
+      if (!pid.startsWith("replicate:") || ["succeeded", "failed", "canceled"].includes(job.status)) return json({ job });
+      const r = await fetch(`https://api.replicate.com/v1/predictions/${pid.slice(10)}`, { headers: { Authorization: `Bearer ${replicateToken}` } });
       const p = await r.json();
-      const patch: Record<string, unknown> = { status: p.status, updated_at: new Date() };
       if (p.status === "succeeded") {
-        const outUrl = Array.isArray(p.output) ? p.output[0] : p.output;
-        const bytes = new Uint8Array(await (await fetch(outUrl)).arrayBuffer());
-        const path = `${user.id}/${job.id}.mp4`;
-        const up = await admin.storage.from("results").upload(path, bytes, { contentType: "video/mp4", upsert: true });
-        if (up.error) { patch.status = "failed"; patch.error = up.error.message; } else patch.output_path = path;
-      } else if (p.status === "failed" || p.status === "canceled") {
-        patch.error = p.error ?? p.status;
+        try {
+          const path = await saveOutput(Array.isArray(p.output) ? p.output[0] : p.output);
+          const { data } = await patch({ status: "succeeded", output_path: path });
+          return json({ job: data });
+        } catch (e) { return fail(String((e as Error).message), 502); }
       }
-      const { data } = await admin.from("jobs").update(patch).eq("id", job.id).select().single();
-      return json({ job: data });
+      if (p.status === "failed" || p.status === "canceled") return fail(p.error ?? p.status, 200);
+      return json({ job });
     }
     return json({ error: "Unknown action" }, 400);
   } catch (e) {
-    return json({ error: String(e?.message ?? e) }, 500);
+    return json({ error: String((e as Error)?.message ?? e) }, 500);
   }
 });

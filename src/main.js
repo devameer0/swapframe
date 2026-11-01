@@ -90,7 +90,7 @@ async function dashboard() {
    <label>Source video (${LIMITS.minSec}–${LIMITS.maxSec}s, ≤${S.max_upload_mb} MB, MP4/MOV/WebM)</label><input type="file" id="vid" accept="video/mp4,video/quicktime,video/webm"/>
    <label>Character image (PNG/JPG/WebP, ≤10 MB)</label><input type="file" id="img" accept="image/png,image/jpeg,image/webp"/>
    <img id="imgprev" class="preview" hidden alt="character preview"/>
-   <label>Quality</label><select id="res"><option value="720">720p</option><option value="480">480p (cheaper)</option></select>
+   <label>Quality</label><select id="res"><option value="low">Standard (faster)</option><option value="high">High (slower)</option></select>
    <label class="check" style="margin-top:16px"><input type="checkbox" id="consent"/><span>I own or have permission to use this video and character; no real person's likeness without consent.</span></label>
    <p style="margin-top:16px"><button class="btn" id="go" disabled>Generate</button></p>
    <div class="bar"><i id="prog"></i></div><div id="stat" style="color:var(--mute);font-size:14px">Idle</div><div class="err" id="err"></div>
@@ -105,9 +105,9 @@ async function dashboard() {
   if (configured) { loadHistory(); loadMe(); }
 }
 async function loadMe() {
-  const { data } = await sb.from('profiles').select('credits,banned').eq('id', session.user.id).maybeSingle();
+  const { data } = await sb.from('profiles').select('banned').eq('id', session.user.id).maybeSingle();
   const el = $('#me'); if (!el || !data) return;
-  el.innerHTML = data.banned ? '<span style="color:var(--bad)">Your account is suspended.</span>' : `Credits: ${data.credits} · Daily limit: ${S.daily_limit || 'none'}`;
+  el.innerHTML = data.banned ? '<span style="color:var(--bad)">Your account is suspended.</span>' : 'Free &amp; unlimited — no credits needed.';
 }
 
 const setProg = (pct, text) => { $('#prog').style.width = pct + '%'; $('#stat').textContent = text; };
@@ -135,9 +135,59 @@ async function startJob() {
     const { data: job, error } = await sb.from('jobs').insert({ user_id: uid, video_path: vp, image_path: ip, consent: true }).select().single();
     if (error) throw error;
     setProg(25, 'Starting generation…');
-    await callFn({ action: 'start', job_id: job.id, resolution: $('#res').value });
-    loadHistory(); loadMe(); poll(job.id);
+    const dur = await videoDuration(video).catch(() => 10);
+    const st = await callFn({ action: 'start', job_id: job.id });
+    loadHistory();
+    if (st.provider === 'replicate') { poll(job.id); return; }
+    await runHF(job.id, st, dur, $('#res').value === 'high' ? 'Medium Res' : 'Low Res');
   } catch (e) { err.textContent = e.message || String(e); setProg(0, 'Failed'); $('#go').disabled = false; }
+}
+
+// Free path: call the Hugging Face Space (Gradio HTTP API) straight from the browser, because ZeroGPU jobs
+// can run longer than an Edge Function stays alive. The edge function then stores the result.
+async function runHF(jobId, st, dur, res) {
+  const space = st.space;
+  try {
+    setProg(30, 'Sending files to the free GPU…');
+    const fd = new FormData();
+    const [vb, ib] = await Promise.all([fetch(st.video_url).then((r) => r.blob()), fetch(st.image_url).then((r) => r.blob())]);
+    fd.append('files', vb, 'video.mp4'); fd.append('files', ib, 'character.png');
+    const upRes = await fetch(`${space}/gradio_api/upload`, { method: 'POST', body: fd });
+    if (!upRes.ok) throw new Error(`Space upload failed (${upRes.status})`);
+    const [vp, ip] = await upRes.json();
+    const file = (path) => ({ path, meta: { _type: 'gradio.FileData' } });
+    const seconds = Math.max(2, Math.min(20, Math.floor(dur)));
+    const call = await fetch(`${space}/gradio_api/call/animate_scene`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: [file(vp), seconds, file(ip), 'Character Swap', res] }) });
+    if (!call.ok) throw new Error(`Space call failed (${call.status})`);
+    const { event_id } = await call.json();
+    setProg(40, 'In the free GPU queue… this can take several minutes. Keep this tab open.');
+    const stream = await fetch(`${space}/gradio_api/call/animate_scene/${event_id}`);
+    const reader = stream.body.getReader(); const dec = new TextDecoder(); let buf = '', ev = '', n = 0, out = null;
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i; while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (line.startsWith('event:')) ev = line.slice(6).trim();
+        else if (line.startsWith('data:')) {
+          const d = line.slice(5).trim();
+          if (ev === 'error') throw new Error(JSON.parse(d || '{}')?.error || 'The free GPU Space returned an error (it may be out of free quota or busy). Try again later.');
+          if (ev === 'complete') { const arr = JSON.parse(d); const v = arr[0]; out = v?.url || v?.video?.url || null; }
+          if (ev === 'generating' || ev === 'heartbeat') setProg(Math.min(95, 40 + ++n), 'Rendering on the free GPU… keep this tab open.');
+        }
+      }
+      if (out) break;
+    }
+    if (!out) throw new Error('The Space finished without a video.');
+    setProg(96, 'Saving your result…');
+    const { job } = await callFn({ action: 'complete', job_id: jobId, output_url: out });
+    setProg(100, 'Done'); showResult(job); loadHistory(); $('#go').disabled = false;
+  } catch (e) {
+    const r = await callFn({ action: 'fail', job_id: jobId, error: e.message }).catch(() => ({}));
+    setProg(0, 'Failed'); $('#err').textContent = e.message + (r.replicate_available ? ' (A paid backup is enabled by the admin.)' : '');
+    loadHistory(); $('#go').disabled = false;
+  }
 }
 
 function poll(id) {
@@ -147,7 +197,7 @@ function poll(id) {
       const { job } = await callFn({ action: 'status', job_id: id }); n++;
       if (job.status === 'succeeded') { setProg(100, 'Done'); showResult(job); loadHistory(); $('#go').disabled = false; return; }
       if (job.status === 'failed' || job.status === 'canceled') { setProg(0, 'Failed'); $('#err').textContent = job.error || 'Generation failed'; loadHistory(); $('#go').disabled = false; return; }
-      setProg(Math.min(95, 30 + n * 2), `Rendering (${job.status})… this can take several minutes`);
+      setProg(Math.min(95, 30 + n * 2), `Rendering (${job.status})… free GPU queue, this can take several minutes`);
     } catch (e) { $('#stat').textContent = 'Retrying status… ' + e.message; }
     pollTimer = setTimeout(tick, 6000);
   };
@@ -170,7 +220,7 @@ async function loadHistory() {
   if (!data.length) { h.textContent = 'No jobs yet.'; return; }
   h.innerHTML = `<table><tr><th>Created</th><th>Status</th><th></th></tr>${data.map((j) => `<tr><td>${esc(new Date(j.created_at).toLocaleString())}</td>
    <td><span class="pill ${esc(j.status)}">${esc(j.status)}</span></td><td>${j.status === 'succeeded' ? `<a href="#" data-view="${esc(j.id)}">View</a>`
-   : ['queued', 'starting', 'processing'].includes(j.status) && j.prediction_id ? `<a href="#" data-poll="${esc(j.id)}">Track</a>` : esc(j.error || '')}</td></tr>`).join('')}</table>`;
+   : ['queued', 'starting', 'processing'].includes(j.status) && String(j.prediction_id || '').startsWith('replicate:') ? `<a href="#" data-poll="${esc(j.id)}">Track</a>` : esc(j.error || '')}</td></tr>`).join('')}</table>`;
   h.querySelectorAll('[data-view]').forEach((a) => a.onclick = (e) => { e.preventDefault(); showResult(data.find((j) => j.id === a.dataset.view)); });
   h.querySelectorAll('[data-poll]').forEach((a) => a.onclick = (e) => { e.preventDefault(); poll(a.dataset.poll); });
 }

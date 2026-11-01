@@ -9,26 +9,27 @@ export const DEFAULTS = {
   cta_text: 'Get started',
   announcement: '',
   sections: [
-    { title: '01 · Drop a clip', text: 'MP4, MOV or WebM, 10–30 seconds, up to 100 MB.' },
+    { title: '01 · Drop a clip', text: 'MP4, MOV or WebM, 2–20 seconds, up to 100 MB. Short clips render fastest.' },
     { title: '02 · Pick a character', text: 'A clear PNG, JPG or WebP of the character you want in the shot.' },
     { title: '03 · Get the recast', text: 'Same motion and framing, new performer. Download it or find it in your history.' },
   ],
   footer_text: 'Outputs are AI-generated. Only use footage and characters you own or have permission to use.',
   footer_links: [{ label: 'GitHub', url: 'https://github.com/devameer0/swapframe' }],
   theme: 'dark',
-  primary: '#b6ff3b',
-  accent: '#38e1ff',
-  font: 'system',
+  primary: '#ffffff',
+  accent: '#a6a6a6',
+  font: 'figtree',
   background: '',
   max_upload_mb: 100,
-  min_seconds: 10,
-  max_seconds: 30,
-  daily_limit: 3,
+  min_seconds: 2,
+  max_seconds: 20, // the free HF Space renders at most 20s
+  daily_limit: 0, // 0 = unlimited (SwapFrame is free for everyone)
   signups_open: true,
   maintenance_mode: false,
 };
 
 export const FONTS = {
+  figtree: '"Figtree",system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif',
   system: 'ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,sans-serif',
   mono: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
   serif: 'ui-serif,Georgia,"Times New Roman",serif',
@@ -39,12 +40,14 @@ export function applyTheme(s) {
   const r = document.documentElement.style;
   const light = s.theme === 'light';
   const vars = light
-    ? { bg: '#f6f7fb', panel: '#ffffff', line: '#e3e6ee', text: '#11131a', mute: '#5b6273' }
-    : { bg: '#07080b', panel: '#0f1117', line: '#1e222c', text: '#e8eaf0', mute: '#8a90a0' };
+    ? { bg: '#f4f4f4', panel: '#ffffff', panel2: '#ebebeb', line: 'rgba(0,0,0,.14)', text: '#0a0a0a', mute: '#5c5c5c' }
+    : { bg: '#0a0a0a', panel: '#111111', panel2: '#151515', line: 'rgba(255,255,255,.16)', text: '#ffffff', mute: '#a6a6a6' };
   for (const [k, v] of Object.entries(vars)) r.setProperty('--' + k, v);
-  r.setProperty('--acc', s.primary || DEFAULTS.primary);
+  let acc = s.primary || DEFAULTS.primary;
+  if (light && /^#f{3,6}$/i.test(acc)) acc = '#0a0a0a'; // keep contrast on light theme
+  r.setProperty('--acc', acc);
   r.setProperty('--acc2', s.accent || DEFAULTS.accent);
-  r.setProperty('--font', FONTS[s.font] || FONTS.system);
+  r.setProperty('--font', FONTS[s.font] || FONTS.figtree);
   r.setProperty('--bgimg', s.background ? (/^(https?:|data:)/.test(s.background) ? `url("${s.background.replace(/"/g, '')}") center/cover fixed` : s.background) : 'none');
   document.title = `${s.site_name} — recast any clip`;
 }
