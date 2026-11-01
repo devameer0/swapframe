@@ -228,6 +228,10 @@ async function gradioRun(space, apiName, buildData, files, label) {
   throw new Error(`${label}: connection closed before a result.`);
 }
 const imgSize = (f) => new Promise((res) => { const i = new Image(); i.onload = () => { res([i.naturalWidth, i.naturalHeight]); URL.revokeObjectURL(i.src); }; i.onerror = () => res([1024, 1024]); i.src = URL.createObjectURL(f); });
+const resizeBlob = (b, max) => new Promise((res) => { const i = new Image(); i.onload = () => { const k = max / Math.max(i.naturalWidth, i.naturalHeight);
+  const c = document.createElement('canvas'); c.width = Math.round(i.naturalWidth * k); c.height = Math.round(i.naturalHeight * k);
+  c.getContext('2d').drawImage(i, 0, 0, c.width, c.height); URL.revokeObjectURL(i.src); c.toBlob((o) => res(o || b), 'image/png'); };
+  i.onerror = () => res(b); i.src = URL.createObjectURL(b); });
 async function runHF(jobId, st, photo) {
   try {
     setProg(30, 'Sending photos to the free GPU…');
