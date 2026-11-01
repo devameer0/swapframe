@@ -184,58 +184,77 @@ async function startJob() {
   } catch (e) { err.textContent = e.message || String(e); setProg(0, 'Failed'); $('#go').disabled = false; }
 }
 
-// Free path: call the Hugging Face Space (Gradio queue API) straight from the visitor's browser so ZeroGPU quota
-// is per visitor. Space: linoyts/Flux2-Klein-Face-Swap, endpoint /face_swap (reference_face, target_image, ...).
+// Free path: call Hugging Face Spaces (Gradio queue API) straight from the visitor's browser so ZeroGPU quota is per visitor.
+// Primary: black-forest-labs/FLUX.2-klein-4B /infer — multi-reference edit: [photo, character] + prompt => same photo,
+// same clothes/pose/background, but the person becomes the character. Fallback: linoyts/Flux2-Klein-Face-Swap /face_swap.
+const SWAP_PROMPT = "Use image 1 as the base image and keep its background, sky, colors, lighting, framing, pose and clothes exactly unchanged. Replace only the person's head, face, hair and skin with the character from image 2. Ignore the background and clothes of image 2.";
 const imgSize = (f) => new Promise((res) => { const i = new Image(); i.onload = () => { res([i.naturalWidth, i.naturalHeight]); URL.revokeObjectURL(i.src); }; i.onerror = () => res([1024, 1024]); i.src = URL.createObjectURL(f); });
+// resize so the longest side is `max` (keeps the photo dominant over the character reference)
+const resizeBlob = (b, max) => new Promise((res) => { const i = new Image(); i.onload = () => { const k = max / Math.max(i.naturalWidth, i.naturalHeight);
+  const c = document.createElement('canvas'); c.width = Math.round(i.naturalWidth * k); c.height = Math.round(i.naturalHeight * k);
+  c.getContext('2d').drawImage(i, 0, 0, c.width, c.height); URL.revokeObjectURL(i.src); c.toBlob((o) => res(o || b), 'image/png'); };
+  i.onerror = () => res(b); i.src = URL.createObjectURL(b); });
+async function gradioRun(space, apiName, buildData, files, label) {
+  const fd = new FormData(); files.forEach(([b, n]) => fd.append('files', b, n));
+  const upRes = await fetch(`${space}/gradio_api/upload`, { method: 'POST', body: fd });
+  if (!upRes.ok) throw new Error(`${label}: upload failed (${upRes.status}): ${(await upRes.text()).slice(0, 200)}`);
+  const paths = await upRes.json();
+  const cfg = await fetch(`${space}/config`).then((r) => r.json());
+  const fnIndex = cfg.dependencies.findIndex((d) => d.api_name === apiName);
+  if (fnIndex < 0) throw new Error(`${label}: the Space no longer has the /${apiName} endpoint.`);
+  const data = buildData(paths.map((path) => ({ path, meta: { _type: 'gradio.FileData' } })));
+  while (data.length < cfg.dependencies[fnIndex].inputs.length) data.push(null);
+  const session = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const join = await fetch(`${space}/gradio_api/queue/join`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data, fn_index: fnIndex, trigger_id: null, session_hash: session }) });
+  if (!join.ok) throw new Error(`${label}: queue refused the job (${join.status}): ${(await join.text()).slice(0, 200)}`);
+  setProg(40, 'In the free GPU queue… usually under a minute. Keep this tab open.');
+  const stream = await fetch(`${space}/gradio_api/queue/data?session_hash=${session}`);
+  if (!stream.ok) throw new Error(`${label}: stream failed (${stream.status})`);
+  const reader = stream.body.getReader(); const dec = new TextDecoder(); let buf = '';
+  for (;;) {
+    const r = await reader.read(); if (r.done) break;
+    buf += dec.decode(r.value, { stream: true });
+    let i; while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith('data:')) continue;
+      let m; try { m = JSON.parse(line.slice(5)); } catch { continue; }
+      if (m.msg === 'estimation') setProg(40, `Free GPU queue: position ${(m.rank ?? 0) + 1}${m.rank_eta ? `, about ${Math.round(m.rank_eta)}s` : ''}. Keep this tab open.`);
+      else if (m.msg === 'process_starts') setProg(50, `Rendering on the free GPU (${label})…`);
+      else if (m.msg === 'progress' && m.progress_data?.[0]) { const p = m.progress_data[0]; setProg(Math.min(94, 50 + Math.round(40 * (p.index / (p.length || 1)))), `Rendering… ${p.desc || ''} ${p.index}/${p.length}`); }
+      else if (m.msg === 'process_completed') {
+        if (!m.success) throw new Error(`${label} error: ` + ([m.output?.title, m.output?.error].filter(Boolean).join(' — ') || 'unknown error (the Space may be busy or out of free GPU quota; retry later)'));
+        const v = m.output?.data?.[0]; const pick = Array.isArray(v) ? v[v.length - 1] : v; // ImageSlider returns [before, after]
+        const out = pick?.url || pick?.image?.url || null;
+        if (!out) throw new Error(`${label}: finished without an image.`);
+        return out;
+      } else if (m.msg === 'unexpected_error' || m.msg === 'queue_full') throw new Error(`${label}: ` + (m.message || m.msg));
+    }
+  }
+  throw new Error(`${label}: connection closed before a result.`);
+}
 async function runHF(jobId, st, photo) {
-  const space = st.space;
   try {
     setProg(30, 'Sending photos to the free GPU…');
-    const fd = new FormData();
     const [pb, ib] = await Promise.all([fetch(st.photo_url || st.video_url).then((r) => r.blob()), fetch(st.image_url).then((r) => r.blob())]);
-    fd.append('files', pb, 'photo.' + (pb.type.split('/')[1] || 'png')); fd.append('files', ib, 'character.' + (ib.type.split('/')[1] || 'png'));
-    const upRes = await fetch(`${space}/gradio_api/upload`, { method: 'POST', body: fd });
-    if (!upRes.ok) throw new Error(`Space upload failed (${upRes.status}): ${(await upRes.text()).slice(0, 200)}`);
-    const [pp, ip] = await upRes.json();
-    const file = (path) => ({ path, meta: { _type: 'gradio.FileData' } });
     // keep the photo's aspect ratio, longest side 1024, multiples of 16
     let [w, h] = await imgSize(photo); const k = 1024 / Math.max(w, h);
     w = Math.max(256, Math.round(w * k / 16) * 16); h = Math.max(256, Math.round(h * k / 16) * 16);
-    const cfg = await fetch(`${space}/config`).then((r) => r.json());
-    const fnIndex = cfg.dependencies.findIndex((d) => d.api_name === 'face_swap');
-    if (fnIndex < 0) throw new Error('This Space no longer has the face_swap endpoint.');
-    const data = [file(ip), file(pp), 0, true, w, h, 4, 1.0];
-    while (data.length < cfg.dependencies[fnIndex].inputs.length) data.push(null);
-    const session = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    const join = await fetch(`${space}/gradio_api/queue/join`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data, fn_index: fnIndex, trigger_id: null, session_hash: session }) });
-    if (!join.ok) throw new Error(`Space queue refused the job (${join.status}): ${(await join.text()).slice(0, 200)}`);
-    setProg(40, 'In the free GPU queue… usually under a minute. Keep this tab open.');
-    const stream = await fetch(`${space}/gradio_api/queue/data?session_hash=${session}`);
-    if (!stream.ok) throw new Error(`Space stream failed (${stream.status})`);
-    const reader = stream.body.getReader(); const dec = new TextDecoder(); let buf = '', out = null, done = false;
-    while (!done) {
-      const r = await reader.read(); if (r.done) break;
-      buf += dec.decode(r.value, { stream: true });
-      let i; while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (!line.startsWith('data:')) continue;
-        let m; try { m = JSON.parse(line.slice(5)); } catch { continue; }
-        if (m.msg === 'estimation') setProg(40, `Free GPU queue: position ${(m.rank ?? 0) + 1}${m.rank_eta ? `, about ${Math.round(m.rank_eta)}s` : ''}. Keep this tab open.`);
-        else if (m.msg === 'process_starts') setProg(50, 'Rendering on the free GPU…');
-        else if (m.msg === 'progress' && m.progress_data?.[0]) { const p = m.progress_data[0]; setProg(Math.min(94, 50 + Math.round(40 * (p.index / (p.length || 1)))), `Rendering… ${p.desc || ''} ${p.index}/${p.length}`); }
-        else if (m.msg === 'process_completed') {
-          done = true;
-          if (!m.success) throw new Error('Hugging Face Space error: ' + ([m.output?.title, m.output?.error].filter(Boolean).join(' — ') || 'unknown error (the Space may be busy or out of free GPU quota; retry later)'));
-          const v = m.output?.data?.[0]; const pick = Array.isArray(v) ? v[v.length - 1] : v; // ImageSlider returns [before, after]
-          out = pick?.url || pick?.image?.url || null;
-        } else if (m.msg === 'unexpected_error' || m.msg === 'queue_full') { done = true; throw new Error('Hugging Face Space: ' + (m.message || m.msg)); }
-      }
+    let out, firstErr;
+    try {
+      const [p1, c1] = await Promise.all([resizeBlob(pb, 1024), resizeBlob(ib, 640)]);
+      out = await gradioRun(st.space, st.api_name || 'infer', ([pp, ip]) => [st.prompt || SWAP_PROMPT, [{ image: pp }, { image: ip }], 'Distilled (4 steps)', 0, true, w, h, 4, 1.0, false],
+        [[p1, 'photo.png'], [c1, 'character.png']], 'Full character swap');
+    } catch (e) {
+      firstErr = e; if (!st.fallback_space) throw e;
+      setProg(35, 'Full swap unavailable (' + e.message.slice(0, 120) + '). Trying the face-swap fallback…');
+      out = await gradioRun(st.fallback_space, 'face_swap', ([pp, ip]) => [ip, pp, 0, true, w, h, 4, 1.0],
+        [[pb, 'photo.' + (pb.type.split('/')[1] || 'png')], [ib, 'character.' + (ib.type.split('/')[1] || 'png')]], 'Face-swap fallback')
+        .catch((e2) => { throw new Error(`${firstErr.message} | ${e2.message}`); });
     }
-    if (!out) throw new Error('The Space finished without an image.');
     setProg(96, 'Saving your result…');
     const { job } = await callFn({ action: 'complete', job_id: jobId, output_url: out });
-    setProg(100, 'Done'); showResult(job); loadHistory(); $('#go').disabled = false;
+    setProg(100, firstErr ? 'Done (face-swap fallback used: full swap was unavailable)' : 'Done'); showResult(job); loadHistory(); $('#go').disabled = false;
   } catch (e) {
     const r = await callFn({ action: 'fail', job_id: jobId, error: e.message }).catch(() => ({}));
     setProg(0, 'Failed'); $('#err').textContent = e.message + (r.replicate_available ? ' (A paid backup is enabled by the admin.)' : '');

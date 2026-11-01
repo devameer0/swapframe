@@ -1,6 +1,7 @@
 // SwapFrame `swap` edge function.
 //
-// Free path (default): Hugging Face Space linoyts/Flux2-Klein-Face-Swap (FLUX.2 Klein, endpoint /face_swap).
+// Free path (default): HF Space black-forest-labs/FLUX.2-klein-4B (/infer, multi-reference full character swap),
+// with linoyts/Flux2-Klein-Face-Swap (/face_swap) as automatic fallback.
 //   PHOTO mode: the browser holds the Gradio queue stream (ZeroGPU quota is per visitor) and this function does the trusted parts:
 //   POST {action:"start", job_id}                -> checks ban/maintenance, returns short-lived signed input URLs
 //   POST {action:"complete", job_id, output_url} -> downloads the Space's output (hf.space only) into `results`
@@ -10,7 +11,9 @@
 //   POST {action:"status", job_id}                      -> polls Replicate and saves the output
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-const HF_SPACE_HOST = "linoyts-flux2-klein-face-swap.hf.space";
+const HF_SPACE_HOST = "black-forest-labs-flux-2-klein-4b.hf.space"; // full character swap (multi-reference edit)
+const HF_FALLBACK_HOST = "linoyts-flux2-klein-face-swap.hf.space"; // face-swap fallback
+const HF_HOSTS = [HF_SPACE_HOST, HF_FALLBACK_HOST];
 const REPLICATE_MODEL = "wan-video/wan-2.2-animate-replace";
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -86,7 +89,7 @@ Deno.serve(async (req) => {
         return json({ job: data, provider: "replicate" });
       }
       const { data } = await patch({ prediction_id: "hf", status: "processing", error: null });
-      return json({ job: data, provider: "hf", space: `https://${HF_SPACE_HOST}`, photo_url: video, video_url: video, image_url: character_image,
+      return json({ job: data, provider: "hf", space: `https://${HF_SPACE_HOST}`, api_name: "infer", fallback_space: `https://${HF_FALLBACK_HOST}`, photo_url: video, video_url: video, image_url: character_image,
         replicate_available: !!replicateToken });
     }
 
@@ -94,7 +97,7 @@ Deno.serve(async (req) => {
       if (job.status === "succeeded") return json({ job });
       let u: URL;
       try { u = new URL(String(output_url)); } catch { return json({ error: "Bad output URL" }, 400); }
-      if (u.protocol !== "https:" || u.hostname !== HF_SPACE_HOST) return json({ error: "Output must come from the SwapFrame HF Space" }, 400);
+      if (u.protocol !== "https:" || !HF_HOSTS.includes(u.hostname)) return json({ error: "Output must come from the SwapFrame HF Space" }, 400);
       try {
         const path = await saveOutput(u.toString());
         const { data } = await patch({ status: "succeeded", output_path: path, error: null });
