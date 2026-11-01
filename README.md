@@ -4,7 +4,7 @@ Recast any short clip: upload a video and a character image, and SwapFrame retur
 
 **Live:** https://devameer0.github.io/swapframe/
 
-- Frontend: Vite + vanilla JS, deployed to GitHub Pages by GitHub Actions (`.github/workflows/pages.yml`).
+- Frontend: Vite + vanilla JS, deployed to GitHub Pages from the `gh-pages` branch (`npm run deploy`).
 - Auth, storage, database: [Supabase](https://supabase.com) (email/password, private buckets, `jobs` table with RLS).
 - AI: Supabase Edge Function `swap` → Replicate model [`wan-video/wan-2.2-animate-replace`](https://replicate.com/wan-video/wan-2.2-animate-replace) (inputs: `video`, `character_image`, `resolution`, `merge_audio`, `go_fast`, …).
 - Your Replicate token only ever lives as a Supabase function secret. It is never in the frontend.
@@ -35,7 +35,7 @@ Without a backend configured, the site still loads and shows the full UI with a 
    window.SWAPFRAME_CONFIG = { SUPABASE_URL: "https://xxxx.supabase.co", SUPABASE_ANON_KEY: "eyJ..." };
    ```
    The anon key is safe to publish (RLS protects data). Never put the Replicate token here.
-7. **Redeploy:** commit and push to `main`. GitHub Actions rebuilds and publishes Pages automatically.
+7. **Redeploy:** commit to `main`, then run `npm install && npm run deploy` — it builds and pushes `dist/` to the `gh-pages` branch that Pages serves (live in ~1 minute).
 
 ## Local dev
 ```bash
